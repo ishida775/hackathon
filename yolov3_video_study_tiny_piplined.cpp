@@ -54,13 +54,10 @@ bool bReading = true;  // flag of reding input frame
 
 std::mutex log_mutex;
 constexpr int debug_period = 30;
-constexpr size_t kDecoderThreadCount = 1;
-constexpr size_t kReadFrameThreadCount = 3;
 
+// デバッグ用に1フレームごとの処理時間を保存する構造体
 struct FrameTimings
 {
-    int64_t decoder_frame_us = 0;
-    int64_t read_frame_us = 0;
     int64_t preprocess_frame_us = 0;
     int64_t run_dpu_us = 0;
     int64_t postprocess_frame_us = 0;
@@ -68,6 +65,7 @@ struct FrameTimings
     int64_t display_frame_us = 0;
 };
 
+// 表示するフレームのインデックスとフレーム画像,デバッグ情報を保持する構造体
 struct imagePair
 {
     int first = 0;
@@ -76,13 +74,6 @@ struct imagePair
 
     imagePair() = default;
     imagePair(int index, Mat frame) : first(index), second(std::move(frame)) {}
-};
-
-struct DecodedFrame
-{
-    int index = 0;
-    Mat frame;
-    FrameTimings timings;
 };
 
 int64_t elapsed_us(const Clock::time_point &start, const Clock::time_point &end)
@@ -127,6 +118,11 @@ constexpr size_t kPostprocessThreadCount = 2;
 TensorShape inshapes[1];
 TensorShape outshapes[kYoloOutputCount];
 
+// ----------------------------------------------------------------------------------------
+// キュー
+// ----------------------------------------------------------------------------------------
+
+// 複数スレッドからでも安全に使えるキュー
 template <typename T>
 class concurrent_queue
 {
@@ -172,6 +168,7 @@ public:
         can_pop_.notify_one();
     }
 
+    // キューが満杯の場合は一番古い要素を削除して新しい要素を追加する
     void push_drop_oldest(T value)
     {
         std::unique_lock<std::mutex> guard(mtx_);
@@ -195,6 +192,8 @@ public:
         can_push_.notify_one();
         return value;
     }
+
+    // サイズの取得
     size_type size()
     {
         std::unique_lock<std::mutex> guard(mtx_);
@@ -202,102 +201,106 @@ public:
     }
 };
 
-void decoderFrame(const char *fileName, concurrent_queue<DecodedFrame> &out)
-{
-    static int loop = 3; // video end of three times play
-    VideoCapture video;
-    string videoFile = fileName;
-    start_time = chrono::system_clock::now();
-
-    while (loop > 0)
-    {
-        // loop--; //infinite loop
-        if (!video.open(videoFile))
-        {
-            cout << "Fail to open specified video file:" << videoFile << endl;
-            exit(-1);
-        }
-
-        while (true)
-        {
-            // usleep(20000); // No performanec increase if 20000 --> 2000
-            // auto start_readtime = chrono::system_clock::now();
-            auto decoder_start_time = Clock::now();
-            Mat img;
-            if (!video.read(img))
-            {
-                break;
-            }
-
-            auto decoder_end_time = Clock::now();
-            DecodedFrame decoded;
-            decoded.index = idxInputImage++;
-            decoded.frame = std::move(img);
-            decoded.timings.decoder_frame_us =
-                elapsed_us(decoder_start_time, decoder_end_time);
-            end_time = chrono::system_clock::now();
-            // cout << "\nread img time= " <<
-            //	    std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_readtime).count()
-            //	    << " [mS]" << endl;
-            out.push_drop_oldest(std::move(decoded));
-            // cout << "index=" << idxInputImage << "\n" << flush;
-            // cout << "q size=" << queueInput.size() << "\n" << flush;
-        }
-
-        video.release();
-    }
-    exit(0);
-}
-
-void readFrame(concurrent_queue<DecodedFrame> &in, concurrent_queue<imagePair> &out)
+void monitorQueues(
+    std::atomic<int> &nextFrameIndex,
+    size_t preloadedFrameCount,
+    concurrent_queue<DpuInputFrame> &dpuIn,
+    concurrent_queue<DpuOutputFrame> &dpuOut,
+    concurrent_queue<imagePair> &shw)
 {
     while (true)
     {
-        auto decoded = in.pop();
-        auto read_start_time = Clock::now();
-        imagePair pair(decoded.index, std::move(decoded.frame));
-        pair.timings = decoded.timings;
-        auto read_end_time = Clock::now();
-        pair.timings.read_frame_us = elapsed_us(read_start_time, read_end_time);
-        out.push_drop_oldest(std::move(pair));
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+        std::unique_lock<std::mutex> guard(log_mutex);
+        cerr << "[queue] sourceIndex=" << nextFrameIndex.load()
+             << " preloaded=" << preloadedFrameCount
+             << " dpuIn=" << dpuIn.size()
+             << " dpuOut=" << dpuOut.size()
+             << " shw=" << shw.size()
+             << endl;
     }
 }
 
+// ----------------------------------------------------------------------------------------
+// 動画を処理の前にdramにロードする関数
+// ----------------------------------------------------------------------------------------
+vector<Mat> preloadFramesToDram(const char *fileName)
+{
+    VideoCapture video;
+    string videoFile = fileName;
+    if (!video.open(videoFile))
+    {
+        cout << "Fail to open specified video file:" << videoFile << endl;
+        exit(-1);
+    }
+
+    const auto frameCount = static_cast<int>(video.get(cv::CAP_PROP_FRAME_COUNT));
+    vector<Mat> frames;
+    if (frameCount > 0)
+    {
+        frames.reserve(frameCount);
+    }
+
+    size_t totalBytes = 0;
+    auto preload_start_time = Clock::now();
+    while (true)
+    {
+        Mat img;
+        if (!video.read(img))
+        {
+            break;
+        }
+
+        totalBytes += img.total() * img.elemSize();
+        frames.push_back(std::move(img));
+    }
+
+    video.release();
+    auto preload_end_time = Clock::now();
+    if (frames.empty())
+    {
+        cout << "No frames decoded from specified video file:" << videoFile << endl;
+        exit(-1);
+    }
+
+    std::unique_lock<std::mutex> guard(log_mutex);
+    cerr << fixed << setprecision(3)
+         << "[preload] frames=" << frames.size()
+         << " bytes=" << totalBytes
+         << " time=" << us_to_ms(elapsed_us(preload_start_time, preload_end_time)) << "ms"
+         << endl;
+    return frames;
+}
+
+// -------------------------------------------------------------------------------------------------------
+// 動画を表示
+// -------------------------------------------------------------------------------------------------------
 void displayFrame(concurrent_queue<imagePair> &in)
 {
     Mat frame;
     int index;
-    int latestIndex = -1;
     int displayedCount = 0;
     while (true)
     {
         auto pairIndexImg = in.pop();
         frame = pairIndexImg.second;
         index = pairIndexImg.first;
-        if (index <= latestIndex)
-        {
-            continue;
-        }
-        latestIndex = index;
 
         if (frame.rows <= 0 || frame.cols <= 0)
         {
             continue;
         }
 
+        // FPSの計算,表示
         auto display_start_time = Clock::now();
         auto show_time = chrono::system_clock::now();
         auto dura = (duration_cast<microseconds>(show_time - start_time)).count();
-        ++displayedCount;
         stringstream buffer;
-        // この式に変更は加えない.
+        // この評価式に変更は加えない.
         buffer << fixed << setprecision(1)
                << (float)pairIndexImg.first / (dura / 1000000.f);
         string a = buffer.str() + " FPS";
         putText(frame, a, cv::Point(10, 15), 1, 1, cv::Scalar{0, 0, 240}, 1);
-        // cout << "FPS=" << buffer.str() << "\n" << flush;
-        // cout << "index = " << index << flush;
-        // if (index%2) {
         imshow("YOLOv3 Detection@Xilinx DPU", frame);
         auto key = waitKey(1);
         if (key == 27)
@@ -305,22 +308,22 @@ void displayFrame(concurrent_queue<imagePair> &in)
             bReading = false; // usually true, set false only when 'q' key is pushed.
             exit(0);
         }
-        //}
+
+        // debug用時間計測.
         auto display_end_time = Clock::now();
         pairIndexImg.timings.display_frame_us =
             elapsed_us(display_start_time, display_end_time);
+
+        // debug情報の表示
+        // 各Frameの処理時間を表示する.
         if (should_print_debug(displayedCount))
         {
             std::unique_lock<std::mutex> guard(log_mutex);
             cerr << fixed << setprecision(3)
                  << "[time] frame=" << index
-                 << " decoderFrame="
-                 << us_to_ms(pairIndexImg.timings.decoder_frame_us) << "ms"
-                 << " readFrame="
-                 << us_to_ms(pairIndexImg.timings.read_frame_us) << "ms"
                  << " preprocessFrame="
                  << us_to_ms(pairIndexImg.timings.preprocess_frame_us) << "ms"
-                 << " runDPU=" << us_to_ms(pairIndexImg.timings.run_dpu_us) << "ms"
+                 << " DPUFrame=" << us_to_ms(pairIndexImg.timings.run_dpu_us) << "ms"
                  << " postprocessFrame="
                  << us_to_ms(pairIndexImg.timings.postprocess_frame_us) << "ms"
                  << " postprocess="
@@ -329,104 +332,13 @@ void displayFrame(concurrent_queue<imagePair> &in)
                  << us_to_ms(pairIndexImg.timings.display_frame_us) << "ms"
                  << endl;
         }
-        // cout << "\ndisplay time= " <<
-        //	    std::chrono::duration_cast<std::chrono::milliseconds>(disp_end_time - show_time).count()
-        //      << " [mS]" << flush;
+        ++displayedCount;
     }
 }
 
-// for debug
-void write_output(const string &name, const int8_t *result, const int &size0)
-{
-    ofstream ofs(name, ios_base::binary);
-    if (!ofs)
-    {
-        cout << "Cannot open output file!!" << endl;
-    }
-    else
-    {
-        ofs.write((char *)&result[0], sizeof(int8_t) * size0);
-    }
-}
-
-void post_process(Mat &img, const vector<int8_t *> &out, const GraphInfo &shapes,
-                  const float &scale, const int &sHeight, const int &sWidth)
-{
-    // sHeight and sWidth come from the xmodel input tensor.
-    vector<vector<float>> boxes;
-    char fname[256];
-    for (size_t i = 0; i < out.size(); i++)
-    {
-        int channel = shapes.outTensorList[i].channel;
-        int width = shapes.outTensorList[i].width;
-        int height = shapes.outTensorList[i].height;
-        int sizeOut = shapes.outTensorList[i].size;
-        // cout << "width, height = " << width << ", " << height << endl; // debug
-        // cout << "channel, sizeOut = " << channel << ", " << sizeOut << endl; // debug
-
-        vector<float> result(sizeOut);
-        boxes.reserve(sizeOut);
-
-        /* Store every output node results */
-        // scaling_cast(out[i], scale, result);
-
-        detect(boxes, out[i], channel, height, width, i, sHeight, sWidth, scale);
-
-        /* debug
-        sprintf(fname, "out%d.dat", i);
-        cout << "binary file output : " << fname << endl;
-        cout << "" << endl;
-
-        write_binary(fname, result);
-        */
-    }
-
-    /* Restore the correct coordinate frame of the original image */
-    if (Lbox_on)
-    {
-        correct_region_boxes(boxes, boxes.size(), img.cols, img.rows, sWidth, sHeight);
-    }
-    /* Apply the computation for NMS */
-    // cout << "boxes size: " << boxes.size() << endl; // debug
-    vector<vector<float>> res = applyNMS(boxes, classificationCnt, NMS_THRESHOLD);
-
-    // cout << "boxes size after NMS: " << res.size() << endl;
-    // cout << "class conf, class, xmin, ymin, xmax, ymax" << endl;
-    float h = img.rows;
-    float w = img.cols;
-    for (size_t i = 0; i < res.size(); ++i)
-    {
-        float xmin = (res[i][0] - res[i][2] / 2.0) * w + 1.0;
-        float ymin = (res[i][1] - res[i][3] / 2.0) * h + 1.0;
-        float xmax = (res[i][0] + res[i][2] / 2.0) * w + 1.0;
-        float ymax = (res[i][1] + res[i][3] / 2.0) * h + 1.0;
-
-        // cout<<res[i][res[i][4] + 6]<<" "; // (res[i][4]=class#)+6(offset) means class_score due to the results of apply NMS.
-        // cout<<res[i][4] << " "; // most confident class number
-        // cout<<xmin<<" "<<ymin<<" "<<xmax<<" "<<ymax<<endl;
-
-        if (res[i][res[i][4] + 6] > CONF)
-        {
-            int type = res[i][4];
-
-            if (type == 0)
-            {
-                rectangle(img, Point(xmin, ymin), Point(xmax, ymax),
-                          Scalar(0, 0, 255), 1, 1, 0);
-            }
-            else if (type == 1)
-            {
-                rectangle(img, Point(xmin, ymin), Point(xmax, ymax),
-                          Scalar(255, 0, 0), 1, 1, 0);
-            }
-            else
-            {
-                rectangle(img, Point(xmin, ymin), Point(xmax, ymax),
-                          Scalar(0, 255, 255), 1, 1, 0);
-            }
-        }
-    }
-}
+// -------------------------------------------------------------------------------------------------------
+// 前処理
+// -------------------------------------------------------------------------------------------------------
 
 void setInputImageForYOLO(const Mat &frame, int8_t *data,
                           float input_scale)
@@ -462,19 +374,25 @@ void setInputImageForYOLO(const Mat &frame, int8_t *data,
     free_image(img_yolo);
 }
 
+// Mat画像をDPUが受け取るin8_t型に変換する関数.
+// preprocessの中身.
 void setInputPointer(const Mat &frame, int8_t *data,
                      float scale)
 {
+    // 入力したxmodelのtensorのサイズを取得.
     int width = shapes.inTensorList[0].width;
     int height = shapes.inTensorList[0].height;
     int size = shapes.inTensorList[0].size;
 
+    // 表示用にコピー.
     Mat img = frame.clone();
+
+    // BGR=>RGBに変換して,リサイズする.
     cvtColor(img, img, cv::COLOR_BGR2RGB);
     Mat image2 = cv::Mat(height, width, CV_8SC3); // CV_8SC3 means 3ch singed char data type
     cv::resize(img, image2, Size(width, height), 0, 0, cv::INTER_LINEAR);
 
-    // unsigned char* imdata = img.data;
+    // 画像の各pixelをint8_t型に変換する.
     unsigned char *imdata = image2.data;
     for (int i = 0; i < size; ++i)
     {
@@ -485,6 +403,7 @@ void setInputPointer(const Mat &frame, int8_t *data,
     }
 }
 
+// Mat画像をDPUが受け取るin8_t型に変換する関数.
 void preprocess(
     const Mat &frame,
     int8_t *input_data,
@@ -496,10 +415,52 @@ void preprocess(
     }
     else
     {
+        // 基本的にこっちを使用する
         setInputPointer(frame, input_data, input_scale);
     }
 }
 
+// preprocessのスレッド関数.
+void preprocessFrame(
+    const vector<Mat> &frames,
+    std::atomic<int> &nextFrameIndex,
+    concurrent_queue<DpuInputFrame> &out,
+    int input_size,
+    float input_scale)
+{
+    while (true)
+    {
+        // 複数のpreprocessスレッドが同時に実行されるので,atomicに次の処理するフレームのインデックスを取得する.
+        const int index = nextFrameIndex.fetch_add(1);
+        // 画像の取得.
+        const Mat &frame = frames[static_cast<size_t>(index) % frames.size()];
+        // 開始時間の記録.
+        auto preprocess_start_time = Clock::now();
+
+        // 取得した画像からdpuへ渡すための構造体の作成
+        DpuInputFrame dpuInput;
+        dpuInput.index = index;
+        dpuInput.frame = frame;
+        dpuInput.input.resize(input_size);
+
+        // 処理本体.
+        preprocess(dpuInput.frame, dpuInput.input.data(), input_scale);
+
+        // 　デバッグ.
+        auto preprocess_end_time = Clock::now();
+        dpuInput.timings.preprocess_frame_us =
+            elapsed_us(preprocess_start_time, preprocess_end_time);
+
+        // dpuInのキューに追加.満タンなら待機.
+        out.push(std::move(dpuInput));
+    }
+}
+
+// -------------------------------------------------------------------------------------------------------
+// DPU
+// -------------------------------------------------------------------------------------------------------
+
+// Dpuへの入出力の構造体.
 struct DpuInputFrame
 {
     int index;
@@ -525,13 +486,19 @@ void run_dpu(
     int8_t *input_data,
     const std::array<int8_t *, kYoloOutputCount> &output_data)
 {
+    // DPU runnerに渡すためのTensorBufferを作成.
     std::vector<std::unique_ptr<vart::TensorBuffer>> inputs;
     std::vector<std::unique_ptr<vart::TensorBuffer>> outputs;
+
+    //
     std::vector<vart::TensorBuffer *> inputsPtr;
     std::vector<vart::TensorBuffer *> outputsPtr;
 
+    // input_data を Tensorbufferに.
     inputs.push_back(std::make_unique<CpuFlatTensorBuffer>(
         input_data, input_tensors[0].get()));
+
+    //
     for (size_t i = 0; i < output_data.size(); ++i)
     {
         outputs.push_back(std::make_unique<CpuFlatTensorBuffer>(
@@ -548,52 +515,8 @@ void run_dpu(
     runner->wait(job_id.first, -1);
 }
 
-Mat postprocess(
-    const Mat &frame,
-    const std::array<int8_t *, kYoloOutputCount> &output_data,
-    const GraphInfo &graph_info,
-    float output_scale,
-    int input_height,
-    int input_width,
-    FrameTimings *timings)
-{
-    auto postprocess_start_time = Clock::now();
-    Mat img = frame.clone();
-    vector<int8_t *> results(output_data.begin(), output_data.end());
-    post_process(img, results, graph_info, output_scale, input_height, input_width);
-    auto postprocess_end_time = Clock::now();
-    if (timings != nullptr)
-    {
-        timings->postprocess_us =
-            elapsed_us(postprocess_start_time, postprocess_end_time);
-    }
-    return img;
-}
-
-void preprocessFrame(
-    concurrent_queue<imagePair> &in,
-    concurrent_queue<DpuInputFrame> &out,
-    int input_size,
-    float input_scale)
-{
-    while (true)
-    {
-        auto pairIndexImage = in.pop();
-        auto preprocess_start_time = Clock::now();
-        DpuInputFrame dpuInput;
-        dpuInput.index = pairIndexImage.first;
-        dpuInput.frame = pairIndexImage.second;
-        dpuInput.timings = pairIndexImage.timings;
-        dpuInput.input.resize(input_size);
-        preprocess(dpuInput.frame, dpuInput.input.data(), input_scale);
-        auto preprocess_end_time = Clock::now();
-        dpuInput.timings.preprocess_frame_us =
-            elapsed_us(preprocess_start_time, preprocess_end_time);
-        out.push(std::move(dpuInput));
-    }
-}
-
-void runDPU(
+// DPUのスレッド関数.
+void DPUFrame(
     vart::Runner *runner,
     concurrent_queue<DpuInputFrame> &in,
     concurrent_queue<DpuOutputFrame> &out)
@@ -604,18 +527,24 @@ void runDPU(
 
     while (true)
     {
+        // dpuInキューからDpuInputFrameを取得.
         auto dpuInput = in.pop();
+
         auto run_dpu_start_time = Clock::now();
+
+        // 出力用の構造体の作成.
         DpuOutputFrame dpuOutput;
         dpuOutput.index = dpuInput.index;
         dpuOutput.frame = dpuInput.frame;
         dpuOutput.timings = dpuInput.timings;
 
+        // 出力用のバッファの確保.tinyyolov3であれば出力は2本.
         for (size_t i = 0; i < dpuOutput.output.size(); ++i)
         {
             dpuOutput.output[i].resize(shapes.outTensorList[i].size);
         }
 
+        // run_dpuに渡すためにouput_dataを作成し,run_dpuを実行
         std::array<int8_t *, kYoloOutputCount> output_data = {
             dpuOutput.output[0].data(),
             dpuOutput.output[1].data()};
@@ -627,10 +556,91 @@ void runDPU(
             dpuInput.input.data(),
             output_data);
 
+        // デバッグ用時間測定
         auto run_dpu_end_time = Clock::now();
         dpuOutput.timings.run_dpu_us =
             elapsed_us(run_dpu_start_time, run_dpu_end_time);
+
+        // dpuOutのキューに追加.
         out.push(std::move(dpuOutput));
+    }
+}
+
+// --------------------------------------------------------------------------------------------
+// 後処理
+// --------------------------------------------------------------------------------------------
+
+// DPUの出力tensorを受取り,画像にbboxを描画する関数.
+void postprocess(Mat &img, const vector<int8_t *> &out, const GraphInfo &shapes,
+                 const float &scale, const int &sHeight, const int &sWidth)
+{
+    // sHeight and sWidth come from the xmodel input tensor.
+    // 検出候補のbboxを格納する配列.
+    vector<vector<float>> boxes;
+    char fname[256];
+
+    // dpuの出力tensorを1本ずつ取り出す,tinyyolov3であれば2本.
+    for (size_t i = 0; i < out.size(); i++)
+    {
+        // 出力tensorの形を取得.
+        int channel = shapes.outTensorList[i].channel;
+        int width = shapes.outTensorList[i].width;
+        int height = shapes.outTensorList[i].height;
+        int sizeOut = shapes.outTensorList[i].size;
+
+        // 検出候補のbboxを格納する配列を確保.
+        vector<float> result(sizeOut);
+        boxes.reserve(sizeOut);
+
+        // DPUから出力されたoutからbbox候補を取り出してboxesに追加.
+        detect(boxes, out[i], channel, height, width, i, sHeight, sWidth, scale);
+    }
+
+    /* Restore the correct coordinate frame of the original image */
+    if (Lbox_on)
+    {
+        correct_region_boxes(boxes, boxes.size(), img.cols, img.rows, sWidth, sHeight);
+    }
+
+    // NMSにより,重なり過ぎているbboxを削除.
+    vector<vector<float>> res = applyNMS(boxes, classificationCnt, NMS_THRESHOLD);
+
+    // 実際の描画処理.
+    float h = img.rows;
+    float w = img.cols;
+    for (size_t i = 0; i < res.size(); ++i)
+    {
+        // 非正規化
+        float xmin = (res[i][0] - res[i][2] / 2.0) * w + 1.0;
+        float ymin = (res[i][1] - res[i][3] / 2.0) * h + 1.0;
+        float xmax = (res[i][0] + res[i][2] / 2.0) * w + 1.0;
+        float ymax = (res[i][1] + res[i][3] / 2.0) * h + 1.0;
+
+        // cout<<res[i][res[i][4] + 6]<<" "; // (res[i][4]=class#)+6(offset) means class_score due to the results of apply NMS.
+        // cout<<res[i][4] << " "; // most confident class number
+        // cout<<xmin<<" "<<ymin<<" "<<xmax<<" "<<ymax<<endl;
+
+        // 検出信頼度が閾値以上のbboxのみ描画する.
+        if (res[i][res[i][4] + 6] > CONF)
+        {
+            int type = res[i][4];
+
+            if (type == 0)
+            {
+                rectangle(img, Point(xmin, ymin), Point(xmax, ymax),
+                          Scalar(0, 0, 255), 1, 1, 0);
+            }
+            else if (type == 1)
+            {
+                rectangle(img, Point(xmin, ymin), Point(xmax, ymax),
+                          Scalar(255, 0, 0), 1, 1, 0);
+            }
+            else
+            {
+                rectangle(img, Point(xmin, ymin), Point(xmax, ymax),
+                          Scalar(0, 255, 255), 1, 1, 0);
+            }
+        }
     }
 }
 
@@ -643,19 +653,24 @@ void postprocessFrame(
 {
     while (true)
     {
+
         auto dpuOutput = in.pop();
         auto postprocess_frame_start_time = Clock::now();
-        std::array<int8_t *, kYoloOutputCount> output_data = {
+        Mat img = dpuOutput.frame.clone();
+        vector<int8_t *> results = {
             dpuOutput.output[0].data(),
             dpuOutput.output[1].data()};
-        Mat img = postprocess(
-            dpuOutput.frame,
-            output_data,
+        auto postprocess_start_time = Clock::now();
+        postprocess(
+            img,
+            results,
             shapes,
             output_scale,
             input_height,
-            input_width,
-            &dpuOutput.timings);
+            input_width);
+        auto postprocess_end_time = Clock::now();
+        dpuOutput.timings.postprocess_us =
+            elapsed_us(postprocess_start_time, postprocess_end_time);
         auto postprocess_frame_end_time = Clock::now();
 
         imagePair pair(dpuOutput.index, std::move(img));
@@ -666,28 +681,13 @@ void postprocessFrame(
     }
 }
 
-void monitorQueues(
-    concurrent_queue<DecodedFrame> &decoded,
-    concurrent_queue<imagePair> &fr,
-    concurrent_queue<DpuInputFrame> &dpuIn,
-    concurrent_queue<DpuOutputFrame> &dpuOut,
-    concurrent_queue<imagePair> &shw)
-{
-    while (true)
-    {
-        std::this_thread::sleep_for(std::chrono::seconds(1));
-        std::unique_lock<std::mutex> guard(log_mutex);
-        cerr << "[queue] decoded=" << decoded.size()
-             << " fr=" << fr.size()
-             << " dpuIn=" << dpuIn.size()
-             << " dpuOut=" << dpuOut.size()
-             << " shw=" << shw.size()
-             << endl;
-    }
-}
+// -------------------------------------------------------------------------------------------------------
+// main
+// -------------------------------------------------------------------------------------------------------
 
 int main(const int argc, const char **argv)
 {
+    // 引数の数をチェック
     cout << "concurrency = " << std::thread::hardware_concurrency() << std::endl;
     // Check args
     if (argc != 3)
@@ -697,8 +697,9 @@ int main(const int argc, const char **argv)
         return -1;
     }
     auto xmodel_file = std::string(argv[1]);
+    auto preloadedFrames = preloadFramesToDram(argv[2]);
 
-    // create dpu runner
+    // dpu runnerの作成.
     auto graph = xir::Graph::deserialize(xmodel_file);
     auto subgraph = get_dpu_subgraph(graph.get());
     CHECK_EQ(subgraph.size(), 1u)
@@ -707,17 +708,16 @@ int main(const int argc, const char **argv)
 
     auto runner =
         vart::Runner::create_runner(subgraph[0], "run");
-    // auto runner = vart::Runner::create_runner(subgraph[0], "run");
-    // start_time = chrono::system_clock::now();
     auto inputTensors = runner->get_input_tensors();
     auto outputTensors = runner->get_output_tensors();
 
-    // write_output("input.bin", imageInputs, inSize); // for debug
-    //  get in/out tenosrs
+    //  xmodelの入出力のtensor情報を取得
     int inputCnt = inputTensors.size();
     int outputCnt = outputTensors.size();
     CHECK_EQ(outputCnt, static_cast<int>(kYoloOutputCount))
         << "yolov3-tiny should have two output tensors." << endl;
+
+    //
     TensorShape inshapes[inputCnt];
     TensorShape outshapes[outputCnt];
     shapes.inTensorList = inshapes;
@@ -726,6 +726,7 @@ int main(const int argc, const char **argv)
     CHECK_EQ(shapes.output_mapping.size(), kYoloOutputCount)
         << "yolov3-tiny output mapping should have two entries." << endl;
 
+    // 前処理,後処理,DPU処理に必要なパラメータの取得.
     const int inHeight = shapes.inTensorList[0].height;
     const int inWidth = shapes.inTensorList[0].width;
     const int batchSize = 1; // fixed
@@ -738,38 +739,43 @@ int main(const int argc, const char **argv)
     {
         std::unique_lock<std::mutex> guard(log_mutex);
         cerr << "[debug] debug_period=" << debug_period
-             << " decoderFrameThreads=" << kDecoderThreadCount
-             << " readFrameThreads=" << kReadFrameThreadCount
+             << " preloadedFrames=" << preloadedFrames.size()
              << " timing output: first displayed frame and every debug_period frames"
              << endl;
     }
 
-    concurrent_queue<DecodedFrame> decoded(100);
-    concurrent_queue<imagePair> fr(100), shw(100);
-    concurrent_queue<DpuInputFrame> dpuIn(1);
+    std::atomic<int> nextFrameIndex{0};
+
+    // 各種キューの作成
+    concurrent_queue<imagePair> shw(100);
+    concurrent_queue<DpuInputFrame> dpuIn(10);
     concurrent_queue<DpuOutputFrame> dpuOut(kPostprocessThreadCount);
 
+    // スレッドの作成
     vector<thread> threadsList;
     threadsList.reserve(
-        2 + kDecoderThreadCount + kReadFrameThreadCount +
-        kPreprocessThreadCount + kDpuThreadCount + kPostprocessThreadCount);
-    for (size_t i = 0; i < kDecoderThreadCount; ++i)
-    {
-        threadsList.emplace_back(decoderFrame, argv[2], ref(decoded));
-    }
+        2 + kPreprocessThreadCount + kDpuThreadCount + kPostprocessThreadCount);
+    start_time = chrono::system_clock::now();
     threadsList.emplace_back(
-        monitorQueues, ref(decoded), ref(fr), ref(dpuIn), ref(dpuOut), ref(shw));
-    for (size_t i = 0; i < kReadFrameThreadCount; ++i)
-    {
-        threadsList.emplace_back(readFrame, ref(decoded), ref(fr));
-    }
+        monitorQueues,
+        ref(nextFrameIndex),
+        preloadedFrames.size(),
+        ref(dpuIn),
+        ref(dpuOut),
+        ref(shw));
     for (size_t i = 0; i < kPreprocessThreadCount; ++i)
     {
-        threadsList.emplace_back(preprocessFrame, ref(fr), ref(dpuIn), inSize, input_scale);
+        threadsList.emplace_back(
+            preprocessFrame,
+            ref(preloadedFrames),
+            ref(nextFrameIndex),
+            ref(dpuIn),
+            inSize,
+            input_scale);
     }
     for (size_t i = 0; i < kDpuThreadCount; ++i)
     {
-        threadsList.emplace_back(runDPU, runner.get(), ref(dpuIn), ref(dpuOut));
+        threadsList.emplace_back(DPUFrame, runner.get(), ref(dpuIn), ref(dpuOut));
     }
     for (size_t i = 0; i < kPostprocessThreadCount; ++i)
     {
