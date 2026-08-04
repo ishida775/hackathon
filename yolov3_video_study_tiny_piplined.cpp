@@ -121,7 +121,7 @@ priority_queue<imagePair, vector<imagePair>, paircomp> queueShow; // priority qu
 
 GraphInfo shapes;
 constexpr size_t kYoloOutputCount = 2;
-constexpr size_t kPreprocessThreadCount = 1;
+constexpr size_t kPreprocessThreadCount = 2;
 constexpr size_t kDpuThreadCount = 1;
 constexpr size_t kPostprocessThreadCount = 2;
 TensorShape inshapes[1];
