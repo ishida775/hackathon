@@ -105,6 +105,23 @@ public:
     }
 };
 
+// Dpuへの入出力の構造体.
+struct DpuInputFrame
+{
+    int index;
+    Mat frame;
+    vector<int8_t> input;
+    FrameTimings timings;
+};
+
+struct DpuOutputFrame
+{
+    int index;
+    Mat frame;
+    std::array<vector<int8_t>, kYoloOutputCount> output;
+    FrameTimings timings;
+};
+
 // input frames queue
 queue<pair<int, Mat>> queueInput; // queue of FIFO
 // display frames queue
@@ -226,6 +243,7 @@ void monitorQueues(
 // ----------------------------------------------------------------------------------------
 vector<Mat> preloadFramesToDram(const char *fileName)
 {
+    // 動画ファイルを開く.
     VideoCapture video;
     string videoFile = fileName;
     if (!video.open(videoFile))
@@ -234,6 +252,7 @@ vector<Mat> preloadFramesToDram(const char *fileName)
         exit(-1);
     }
 
+    // 総フレーム数を取得し,framesの容量を確保.
     const auto frameCount = static_cast<int>(video.get(cv::CAP_PROP_FRAME_COUNT));
     vector<Mat> frames;
     if (frameCount > 0)
@@ -243,6 +262,8 @@ vector<Mat> preloadFramesToDram(const char *fileName)
 
     size_t totalBytes = 0;
     auto preload_start_time = Clock::now();
+
+    // 1フレームずつデコードして,framesに格納.
     while (true)
     {
         Mat img;
@@ -270,70 +291,6 @@ vector<Mat> preloadFramesToDram(const char *fileName)
          << " time=" << us_to_ms(elapsed_us(preload_start_time, preload_end_time)) << "ms"
          << endl;
     return frames;
-}
-
-// -------------------------------------------------------------------------------------------------------
-// 動画を表示
-// -------------------------------------------------------------------------------------------------------
-void displayFrame(concurrent_queue<imagePair> &in)
-{
-    Mat frame;
-    int index;
-    int displayedCount = 0;
-    while (true)
-    {
-        auto pairIndexImg = in.pop();
-        frame = pairIndexImg.second;
-        index = pairIndexImg.first;
-
-        if (frame.rows <= 0 || frame.cols <= 0)
-        {
-            continue;
-        }
-
-        // FPSの計算,表示
-        auto display_start_time = Clock::now();
-        auto show_time = chrono::system_clock::now();
-        auto dura = (duration_cast<microseconds>(show_time - start_time)).count();
-        stringstream buffer;
-        // この評価式に変更は加えない.
-        buffer << fixed << setprecision(1)
-               << (float)pairIndexImg.first / (dura / 1000000.f);
-        string a = buffer.str() + " FPS";
-        putText(frame, a, cv::Point(10, 15), 1, 1, cv::Scalar{0, 0, 240}, 1);
-        imshow("YOLOv3 Detection@Xilinx DPU", frame);
-        auto key = waitKey(1);
-        if (key == 27)
-        {
-            bReading = false; // usually true, set false only when 'q' key is pushed.
-            exit(0);
-        }
-
-        // debug用時間計測.
-        auto display_end_time = Clock::now();
-        pairIndexImg.timings.display_frame_us =
-            elapsed_us(display_start_time, display_end_time);
-
-        // debug情報の表示
-        // 各Frameの処理時間を表示する.
-        if (should_print_debug(displayedCount))
-        {
-            std::unique_lock<std::mutex> guard(log_mutex);
-            cerr << fixed << setprecision(3)
-                 << "[time] frame=" << index
-                 << " preprocessFrame="
-                 << us_to_ms(pairIndexImg.timings.preprocess_frame_us) << "ms"
-                 << " DPUFrame=" << us_to_ms(pairIndexImg.timings.run_dpu_us) << "ms"
-                 << " postprocessFrame="
-                 << us_to_ms(pairIndexImg.timings.postprocess_frame_us) << "ms"
-                 << " postprocess="
-                 << us_to_ms(pairIndexImg.timings.postprocess_us) << "ms"
-                 << " displayFrame="
-                 << us_to_ms(pairIndexImg.timings.display_frame_us) << "ms"
-                 << endl;
-        }
-        ++displayedCount;
-    }
 }
 
 // -------------------------------------------------------------------------------------------------------
@@ -459,23 +416,6 @@ void preprocessFrame(
 // -------------------------------------------------------------------------------------------------------
 // DPU
 // -------------------------------------------------------------------------------------------------------
-
-// Dpuへの入出力の構造体.
-struct DpuInputFrame
-{
-    int index;
-    Mat frame;
-    vector<int8_t> input;
-    FrameTimings timings;
-};
-
-struct DpuOutputFrame
-{
-    int index;
-    Mat frame;
-    std::array<vector<int8_t>, kYoloOutputCount> output;
-    FrameTimings timings;
-};
 
 template <typename TensorList>
 void run_dpu(
@@ -653,14 +593,17 @@ void postprocessFrame(
 {
     while (true)
     {
-
+        // dpuOutキューからDpuOutputFrameをpopする.
         auto dpuOutput = in.pop();
         auto postprocess_frame_start_time = Clock::now();
         Mat img = dpuOutput.frame.clone();
+
         vector<int8_t *> results = {
             dpuOutput.output[0].data(),
             dpuOutput.output[1].data()};
         auto postprocess_start_time = Clock::now();
+
+        // 本体.
         postprocess(
             img,
             results,
@@ -671,13 +614,79 @@ void postprocessFrame(
         auto postprocess_end_time = Clock::now();
         dpuOutput.timings.postprocess_us =
             elapsed_us(postprocess_start_time, postprocess_end_time);
-        auto postprocess_frame_end_time = Clock::now();
 
+        auto postprocess_frame_end_time = Clock::now();
         imagePair pair(dpuOutput.index, std::move(img));
         pair.timings = dpuOutput.timings;
         pair.timings.postprocess_frame_us =
             elapsed_us(postprocess_frame_start_time, postprocess_frame_end_time);
+
+        // shwキューに追加.満タンなら一番古い要素を削除して新しい要素を追加する.
         out.push_drop_oldest(std::move(pair));
+    }
+}
+
+// -------------------------------------------------------------------------------------------------------
+// 動画を表示
+// -------------------------------------------------------------------------------------------------------
+void displayFrame(concurrent_queue<imagePair> &in)
+{
+    Mat frame;
+    int index;
+    int displayedCount = 0;
+    while (true)
+    {
+        auto pairIndexImg = in.pop();
+        frame = pairIndexImg.second;
+        index = pairIndexImg.first;
+
+        if (frame.rows <= 0 || frame.cols <= 0)
+        {
+            continue;
+        }
+
+        // FPSの計算,表示
+        auto display_start_time = Clock::now();
+        auto show_time = chrono::system_clock::now();
+        auto dura = (duration_cast<microseconds>(show_time - start_time)).count();
+        stringstream buffer;
+        // この評価式に変更は加えない.
+        buffer << fixed << setprecision(1)
+               << (float)pairIndexImg.first / (dura / 1000000.f);
+        string a = buffer.str() + " FPS";
+        putText(frame, a, cv::Point(10, 15), 1, 1, cv::Scalar{0, 0, 240}, 1);
+        imshow("YOLOv3 Detection@Xilinx DPU", frame);
+        auto key = waitKey(1);
+        if (key == 27)
+        {
+            bReading = false; // usually true, set false only when 'q' key is pushed.
+            exit(0);
+        }
+
+        // debug用時間計測.
+        auto display_end_time = Clock::now();
+        pairIndexImg.timings.display_frame_us =
+            elapsed_us(display_start_time, display_end_time);
+
+        // debug情報の表示
+        // 各Frameの処理時間を表示する.
+        if (should_print_debug(displayedCount))
+        {
+            std::unique_lock<std::mutex> guard(log_mutex);
+            cerr << fixed << setprecision(3)
+                 << "[time] frame=" << index
+                 << " preprocessFrame="
+                 << us_to_ms(pairIndexImg.timings.preprocess_frame_us) << "ms"
+                 << " DPUFrame=" << us_to_ms(pairIndexImg.timings.run_dpu_us) << "ms"
+                 << " postprocessFrame="
+                 << us_to_ms(pairIndexImg.timings.postprocess_frame_us) << "ms"
+                 << " postprocess="
+                 << us_to_ms(pairIndexImg.timings.postprocess_us) << "ms"
+                 << " displayFrame="
+                 << us_to_ms(pairIndexImg.timings.display_frame_us) << "ms"
+                 << endl;
+        }
+        ++displayedCount;
     }
 }
 
