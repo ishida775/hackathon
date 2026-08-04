@@ -1,5 +1,4 @@
 #include <algorithm>
-#include <array>
 #include <vector>
 #include <atomic>
 #include <queue>
@@ -8,7 +7,6 @@
 #include <fstream>
 #include <iomanip>
 #include <chrono>
-#include <memory>
 #include <mutex>
 #include <zconf.h>
 #include <thread>
@@ -332,7 +330,7 @@ void setInputImageForYOLO(const Mat &frame, int8_t *data,
 }
 
 void setInputPointer(const Mat &frame, int8_t *data,
-                     float scale)
+                     const int &scale)
 {
     int width = shapes.inTensorList[0].width;
     int height = shapes.inTensorList[0].height;
@@ -348,169 +346,130 @@ void setInputPointer(const Mat &frame, int8_t *data,
     for (int i = 0; i < size; ++i)
     {
         float dataf = static_cast<float>(imdata[i]);
-        data[i] = static_cast<int8_t>(dataf * scale / 256.0f);
+        data[i] = static_cast<int>((dataf * static_cast<float>(scale) / 256.0));
         if (data[i] < 0)
             data[i] = 127;
     }
 }
 
-struct YoloBuffers
-{
-    std::vector<int8_t> input;
-    std::array<std::vector<int8_t>, 3> output;
-};
-
-YoloBuffers createYoloBuffers(const GraphInfo &graph_info, int batch_size)
-{
-    YoloBuffers buffers;
-    buffers.input.resize(graph_info.inTensorList[0].size * batch_size);
-    for (size_t i = 0; i < buffers.output.size(); ++i)
-    {
-        buffers.output[i].resize(graph_info.outTensorList[i].size * batch_size);
-    }
-    return buffers;
-}
-
-void preprocess(
-    const cv::Mat &frame,
-    int8_t *input_data,
-    const GraphInfo &graph_info,
-    float input_scale)
-{
-    int width = graph_info.inTensorList[0].width;
-    int height = graph_info.inTensorList[0].height;
-    int size = graph_info.inTensorList[0].size;
-
-    if (Lbox_on)
-    {
-        image img_new = load_image_cv(frame);
-        image img_yolo = letterbox_image(img_new, width, height);
-
-        vector<float> bb(size);
-        for (int b = 0; b < height; ++b)
-        {
-            for (int c = 0; c < width; ++c)
-            {
-                for (int a = 0; a < 3; ++a)
-                {
-                    bb[b * width * 3 + c * 3 + a] =
-                        img_yolo.data[a * height * width + b * width + c];
-                }
-            }
-        }
-
-        float scale = pow(2, 7);
-        for (int i = 0; i < size; ++i)
-        {
-            input_data[i] = static_cast<int8_t>(bb.data()[i] * input_scale);
-            if (input_data[i] < 0)
-            {
-                input_data[i] = static_cast<int8_t>((127.0f / scale) * input_scale);
-            }
-        }
-        free_image(img_new);
-        free_image(img_yolo);
-        return;
-    }
-
-    Mat img = frame.clone();
-    cvtColor(img, img, cv::COLOR_BGR2RGB);
-    Mat image2 = cv::Mat(height, width, CV_8SC3);
-    cv::resize(img, image2, Size(width, height), 0, 0, cv::INTER_LINEAR);
-
-    unsigned char *imdata = image2.data;
-    for (int i = 0; i < size; ++i)
-    {
-        float dataf = static_cast<float>(imdata[i]);
-        input_data[i] = static_cast<int8_t>(dataf * input_scale / 256.0f);
-        if (input_data[i] < 0)
-        {
-            input_data[i] = 127;
-        }
-    }
-}
-
-void run_dpu(
-    vart::Runner *runner,
-    int8_t *input_data,
-    const std::array<int8_t *, 3> &output_data,
-    const GraphInfo &graph_info)
-{
-    auto inputTensors = cloneTensorBuffer(runner->get_input_tensors());
-    auto outputTensors = cloneTensorBuffer(runner->get_output_tensors());
-    const vector<int> output_mapping = graph_info.output_mapping;
-
-    std::vector<std::unique_ptr<vart::TensorBuffer>> inputs;
-    std::vector<std::unique_ptr<vart::TensorBuffer>> outputs;
-    std::vector<vart::TensorBuffer *> inputsPtr;
-    std::vector<vart::TensorBuffer *> outputsPtr;
-
-    inputs.push_back(std::make_unique<CpuFlatTensorBuffer>(
-        input_data, inputTensors[0].get()));
-    for (size_t i = 0; i < output_data.size(); ++i)
-    {
-        outputs.push_back(std::make_unique<CpuFlatTensorBuffer>(
-            output_data[i], outputTensors[output_mapping[i]].get()));
-    }
-
-    inputsPtr.push_back(inputs[0].get());
-    for (auto &output : outputs)
-    {
-        outputsPtr.push_back(output.get());
-    }
-
-    auto job_id = runner->execute_async(inputsPtr, outputsPtr);
-    runner->wait(job_id.first, -1);
-}
-
-cv::Mat postprocess(
-    const cv::Mat &frame,
-    const std::array<int8_t *, 3> &output_data,
-    const GraphInfo &graph_info,
-    float output_scale,
-    int input_height,
-    int input_width)
-{
-    vector<int8_t *> results(output_data.begin(), output_data.end());
-    return post_process(frame, results, graph_info, output_scale, input_height, input_width);
-}
-
 Mat runYOLO(vart::Runner *runner, const Mat &frame)
 {
-    const int batchSize = 1;
-    YoloBuffers buffers = createYoloBuffers(shapes, batchSize);
-    std::array<int8_t *, 3> output_data = {
-        buffers.output[0].data(),
-        buffers.output[1].data(),
-        buffers.output[2].data()};
 
+    auto runyolo_pre_starttime = std::chrono::system_clock::now(); // runYOLO starttime
+
+    auto inputTensors = cloneTensorBuffer(runner->get_input_tensors());
+    auto outputTensors = cloneTensorBuffer(runner->get_output_tensors());
+
+    // set input pointer
     int inHeight = shapes.inTensorList[0].height;
     int inWidth = shapes.inTensorList[0].width;
+    int inChannel = 3; // fixed
+    int batchSize = 1; // fixed
+    int inSize = inHeight * inWidth * inChannel;
+    int8_t *imageInputs = new int8_t[inSize * batchSize];
+
+    /*
+    cout << "in_height = " << inHeight << endl;
+    cout << "in_width = " << inWidth << endl;
+    cout << "in_channel = " << inChannel << endl;
+    cout << "batch size = " << batchSize << endl;
+    cout << "\n";
+    */
+    // set output pointer
     vector<int> output_mapping = shapes.output_mapping;
-    auto input_scale = get_input_scale(runner->get_input_tensors()[0]);
     auto conf_output_scale =
         get_output_scale(runner->get_output_tensors()[output_mapping[1]]);
 
-    auto runyolo_pre_starttime = std::chrono::system_clock::now();
-    preprocess(frame, buffers.input.data(), shapes, input_scale);
+    // make output vector
+    const int size0 = shapes.outTensorList[0].size;
+    // cout << "size0 = " << size0 << endl; // debug
+    int8_t *result0 = new int8_t[size0 * batchSize];
+    const int size1 = shapes.outTensorList[1].size;
+    // cout << "size1 = " << size1 << endl; // debug
+    int8_t *result1 = new int8_t[size1 * batchSize];
+    const int size2 = shapes.outTensorList[2].size;
+    // cout << "size2 = " << size2 << endl; // debug
+    int8_t *result2 = new int8_t[size2 * batchSize];
+
+    auto input_scale = get_input_scale(runner->get_input_tensors()[0]);
+    float mean[3] = {0, 0, 0};
+
+    std::vector<std::unique_ptr<vart::TensorBuffer>> inputs, outputs;
+    std::vector<vart::TensorBuffer *> inputsPtr, outputsPtr;
+
+    if (Lbox_on)
+    {
+        setInputImageForYOLO(frame, imageInputs, input_scale);
+    }
+    else
+    {
+        setInputPointer(frame, imageInputs, input_scale);
+    }
+
+    // preparation for execute
+    inputs.push_back(std::make_unique<CpuFlatTensorBuffer>(
+        imageInputs, inputTensors[0].get()));
+    outputs.push_back(std::make_unique<CpuFlatTensorBuffer>(
+        result0, outputTensors[output_mapping[0]].get()));
+    outputs.push_back(std::make_unique<CpuFlatTensorBuffer>(
+        result1, outputTensors[output_mapping[1]].get()));
+    outputs.push_back(std::make_unique<CpuFlatTensorBuffer>(
+        result2, outputTensors[output_mapping[2]].get()));
+
+    inputsPtr.push_back(inputs[0].get());
+    outputsPtr.push_back(outputs[0].get());
+    outputsPtr.push_back(outputs[1].get());
+    outputsPtr.push_back(outputs[2].get());
     auto runyolo_pre_endtime = std::chrono::system_clock::now();
     cout << "\nrunYOLO preprocessing time= " << std::chrono::duration_cast<std::chrono::milliseconds>(runyolo_pre_endtime - runyolo_pre_starttime).count()
          << " [mS]\n"
          << flush;
 
-    auto runyolo_dpu_starttime = std::chrono::system_clock::now();
-    run_dpu(runner, buffers.input.data(), output_data, shapes);
+    auto runyolo_dpu_starttime = std::chrono::system_clock::now(); // runYOLO starttime
+
+    auto job_id = runner->execute_async(inputsPtr, outputsPtr);
+    runner->wait(job_id.first, -1);
+
     auto runyolo_dpu_endtime = std::chrono::system_clock::now();
     cout << "\nrunYOLO dpu time= " << std::chrono::duration_cast<std::chrono::milliseconds>(runyolo_dpu_endtime - runyolo_dpu_starttime).count()
          << " [mS]\n"
          << flush;
 
-    auto runyolo_post_starttime = std::chrono::system_clock::now();
-    auto img = postprocess(frame, output_data, shapes, conf_output_scale, inHeight, inWidth);
+    auto runyolo_post_starttime = std::chrono::system_clock::now(); // runYOLO starttime
+    vector<int8_t *> results = {result0, result1, result2};
+    auto img = post_process(frame, results, shapes, conf_output_scale, inHeight, inWidth);
+    // cv::imwrite("result.jpg", image2);
     auto runyolo_post_endtime = std::chrono::system_clock::now();
     cout << "\nrunYOLO post time= " << std::chrono::duration_cast<std::chrono::milliseconds>(runyolo_post_endtime - runyolo_post_starttime).count()
          << " [mS]\n"
          << flush;
+
+    inputs.clear();
+    outputs.clear();
+    inputsPtr.clear();
+    outputsPtr.clear();
+
+    delete[] imageInputs;
+    delete[] result0;
+    delete[] result1;
+    delete[] result2;
+
+    /*
+    cout << "\npre_process time = " <<
+        std::chrono::duration_cast<std::chrono::milliseconds>(pre_end_time - start_time).count()
+        << " [mS]" << endl;
+    cout << "DPU time = " <<
+        std::chrono::duration_cast<std::chrono::milliseconds>(dpu_end_time - pre_end_time).count()
+        << " [mS]" << endl;
+    cout << "post_process time = " <<
+        std::chrono::duration_cast<std::chrono::milliseconds>(end_time - dpu_end_time).count()
+        << " [mS]" << endl;
+    cout << "-------------------------------------------" << endl;
+    cout << "total proc. time = " <<
+        std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count()
+        << " [mS]" << endl;
+
+    cout << "\nDone yolov3." << endl;*/
 
     return img;
 }
@@ -558,19 +517,6 @@ auto runner3 =
     shapes.outTensorList = outshapes; // get output size
     getTensorShape(runner.get(), &shapes, inputCnt, outputCnt);
 
-    const int batchSize = 1;
-    int inHeight = shapes.inTensorList[0].height;
-    int inWidth = shapes.inTensorList[0].width;
-    YoloBuffers buffers = createYoloBuffers(shapes, batchSize);
-    std::array<int8_t *, 3> output_data = {
-        buffers.output[0].data(),
-        buffers.output[1].data(),
-        buffers.output[2].data()};
-    auto input_scale = get_input_scale(runner->get_input_tensors()[0]);
-    vector<int> output_mapping = shapes.output_mapping;
-    auto conf_output_scale =
-        get_output_scale(runner->get_output_tensors()[output_mapping[1]]);
-
     VideoCapture video;
     if (!video.open(argv[2]))
     {
@@ -590,38 +536,7 @@ auto runner3 =
             break;
         }
 
-        // Mat frame = runYOLO(runner.get(), img);
-
-        auto runyolo_pre_starttime = std::chrono::system_clock::now();
-        preprocess(img, buffers.input.data(), shapes, input_scale);
-        auto runyolo_pre_endtime = std::chrono::system_clock::now();
-        cout << "\nrunYOLO preprocessing time= " << std::chrono::duration_cast<std::chrono::milliseconds>(runyolo_pre_endtime - runyolo_pre_starttime).count()
-             << " [mS]\n"
-             << flush;
-
-        auto runyolo_dpu_starttime = std::chrono::system_clock::now();
-        run_dpu(
-            runner.get(),
-            buffers.input.data(),
-            output_data,
-            shapes);
-        auto runyolo_dpu_endtime = std::chrono::system_clock::now();
-        cout << "\nrunYOLO dpu time= " << std::chrono::duration_cast<std::chrono::milliseconds>(runyolo_dpu_endtime - runyolo_dpu_starttime).count()
-             << " [mS]\n"
-             << flush;
-
-        auto runyolo_post_starttime = std::chrono::system_clock::now();
-        cv::Mat frame = postprocess(
-            img,
-            output_data,
-            shapes,
-            conf_output_scale,
-            inHeight,
-            inWidth);
-        auto runyolo_post_endtime = std::chrono::system_clock::now();
-        cout << "\nrunYOLO post time= " << std::chrono::duration_cast<std::chrono::milliseconds>(runyolo_post_endtime - runyolo_post_starttime).count()
-             << " [mS]\n"
-             << flush;
+        Mat frame = runYOLO(runner.get(), img);
 
         auto runyolo_disp_starttime = std::chrono::system_clock::now(); // runYOLO starttime
         stringstream buffer;
