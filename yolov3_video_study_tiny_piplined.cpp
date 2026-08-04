@@ -53,6 +53,7 @@ int idxShowImage = 0;  // next frame index to be displayed
 bool bReading = true;  // flag of reding input frame
 
 std::mutex log_mutex;
+constexpr int debug_period = 30;
 
 struct FrameTimings
 {
@@ -84,6 +85,11 @@ double us_to_ms(int64_t us)
     return static_cast<double>(us) / 1000.0;
 }
 
+bool should_print_debug(int count)
+{
+    return debug_period > 0 && (count == 1 || count % debug_period == 0);
+}
+
 class paircomp
 {
 public:
@@ -108,7 +114,6 @@ constexpr size_t kYoloOutputCount = 2;
 constexpr size_t kPreprocessThreadCount = 1;
 constexpr size_t kDpuThreadCount = 1;
 constexpr size_t kPostprocessThreadCount = 2;
-constexpr int debug_period = 30;
 TensorShape inshapes[1];
 TensorShape outshapes[kYoloOutputCount];
 
@@ -277,10 +282,10 @@ void displayFrame(concurrent_queue<imagePair> &in)
         auto display_end_time = Clock::now();
         pairIndexImg.timings.display_frame_us =
             elapsed_us(display_start_time, display_end_time);
-        if (debug_period > 0 && displayedCount % debug_period == 0)
+        if (should_print_debug(displayedCount))
         {
             std::unique_lock<std::mutex> guard(log_mutex);
-            cout << fixed << setprecision(3)
+            cerr << fixed << setprecision(3)
                  << "[time] frame=" << index
                  << " readFrame="
                  << us_to_ms(pairIndexImg.timings.read_frame_us) << "ms"
@@ -642,7 +647,7 @@ void monitorQueues(
     {
         std::this_thread::sleep_for(std::chrono::seconds(1));
         std::unique_lock<std::mutex> guard(log_mutex);
-        cout << "[queue] fr=" << fr.size()
+        cerr << "[queue] fr=" << fr.size()
              << " dpuIn=" << dpuIn.size()
              << " dpuOut=" << dpuOut.size()
              << " shw=" << shw.size()
@@ -698,6 +703,13 @@ int main(const int argc, const char **argv)
     vector<int> output_mapping = shapes.output_mapping;
     auto conf_output_scale =
         get_output_scale(runner->get_output_tensors()[output_mapping[1]]);
+
+    {
+        std::unique_lock<std::mutex> guard(log_mutex);
+        cerr << "[debug] debug_period=" << debug_period
+             << " timing output: first displayed frame and every debug_period frames"
+             << endl;
+    }
 
     concurrent_queue<imagePair> fr(100), shw(100);
     concurrent_queue<DpuInputFrame> dpuIn(1);
