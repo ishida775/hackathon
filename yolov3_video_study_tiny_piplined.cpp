@@ -54,9 +54,12 @@ bool bReading = true;  // flag of reding input frame
 
 std::mutex log_mutex;
 constexpr int debug_period = 30;
+constexpr size_t kDecoderThreadCount = 1;
+constexpr size_t kReadFrameThreadCount = 3;
 
 struct FrameTimings
 {
+    int64_t decoder_frame_us = 0;
     int64_t read_frame_us = 0;
     int64_t preprocess_frame_us = 0;
     int64_t run_dpu_us = 0;
@@ -73,6 +76,13 @@ struct imagePair
 
     imagePair() = default;
     imagePair(int index, Mat frame) : first(index), second(std::move(frame)) {}
+};
+
+struct DecodedFrame
+{
+    int index = 0;
+    Mat frame;
+    FrameTimings timings;
 };
 
 int64_t elapsed_us(const Clock::time_point &start, const Clock::time_point &end)
@@ -192,7 +202,7 @@ public:
     }
 };
 
-void readFrame(const char *fileName, concurrent_queue<imagePair> &out)
+void decoderFrame(const char *fileName, concurrent_queue<DecodedFrame> &out)
 {
     static int loop = 3; // video end of three times play
     VideoCapture video;
@@ -212,21 +222,24 @@ void readFrame(const char *fileName, concurrent_queue<imagePair> &out)
         {
             // usleep(20000); // No performanec increase if 20000 --> 2000
             // auto start_readtime = chrono::system_clock::now();
-            auto read_start_time = Clock::now();
+            auto decoder_start_time = Clock::now();
             Mat img;
             if (!video.read(img))
             {
                 break;
             }
 
-            imagePair pair(idxInputImage++, std::move(img));
+            auto decoder_end_time = Clock::now();
+            DecodedFrame decoded;
+            decoded.index = idxInputImage++;
+            decoded.frame = std::move(img);
+            decoded.timings.decoder_frame_us =
+                elapsed_us(decoder_start_time, decoder_end_time);
             end_time = chrono::system_clock::now();
-            auto read_end_time = Clock::now();
-            pair.timings.read_frame_us = elapsed_us(read_start_time, read_end_time);
             // cout << "\nread img time= " <<
             //	    std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_readtime).count()
             //	    << " [mS]" << endl;
-            out.push_drop_oldest(std::move(pair));
+            out.push_drop_oldest(std::move(decoded));
             // cout << "index=" << idxInputImage << "\n" << flush;
             // cout << "q size=" << queueInput.size() << "\n" << flush;
         }
@@ -234,6 +247,20 @@ void readFrame(const char *fileName, concurrent_queue<imagePair> &out)
         video.release();
     }
     exit(0);
+}
+
+void readFrame(concurrent_queue<DecodedFrame> &in, concurrent_queue<imagePair> &out)
+{
+    while (true)
+    {
+        auto decoded = in.pop();
+        auto read_start_time = Clock::now();
+        imagePair pair(decoded.index, std::move(decoded.frame));
+        pair.timings = decoded.timings;
+        auto read_end_time = Clock::now();
+        pair.timings.read_frame_us = elapsed_us(read_start_time, read_end_time);
+        out.push_drop_oldest(std::move(pair));
+    }
 }
 
 void displayFrame(concurrent_queue<imagePair> &in)
@@ -287,6 +314,8 @@ void displayFrame(concurrent_queue<imagePair> &in)
             std::unique_lock<std::mutex> guard(log_mutex);
             cerr << fixed << setprecision(3)
                  << "[time] frame=" << index
+                 << " decoderFrame="
+                 << us_to_ms(pairIndexImg.timings.decoder_frame_us) << "ms"
                  << " readFrame="
                  << us_to_ms(pairIndexImg.timings.read_frame_us) << "ms"
                  << " preprocessFrame="
@@ -638,6 +667,7 @@ void postprocessFrame(
 }
 
 void monitorQueues(
+    concurrent_queue<DecodedFrame> &decoded,
     concurrent_queue<imagePair> &fr,
     concurrent_queue<DpuInputFrame> &dpuIn,
     concurrent_queue<DpuOutputFrame> &dpuOut,
@@ -647,7 +677,8 @@ void monitorQueues(
     {
         std::this_thread::sleep_for(std::chrono::seconds(1));
         std::unique_lock<std::mutex> guard(log_mutex);
-        cerr << "[queue] fr=" << fr.size()
+        cerr << "[queue] decoded=" << decoded.size()
+             << " fr=" << fr.size()
              << " dpuIn=" << dpuIn.size()
              << " dpuOut=" << dpuOut.size()
              << " shw=" << shw.size()
@@ -707,19 +738,31 @@ int main(const int argc, const char **argv)
     {
         std::unique_lock<std::mutex> guard(log_mutex);
         cerr << "[debug] debug_period=" << debug_period
+             << " decoderFrameThreads=" << kDecoderThreadCount
+             << " readFrameThreads=" << kReadFrameThreadCount
              << " timing output: first displayed frame and every debug_period frames"
              << endl;
     }
 
+    concurrent_queue<DecodedFrame> decoded(100);
     concurrent_queue<imagePair> fr(100), shw(100);
     concurrent_queue<DpuInputFrame> dpuIn(1);
     concurrent_queue<DpuOutputFrame> dpuOut(kPostprocessThreadCount);
 
     vector<thread> threadsList;
     threadsList.reserve(
-        3 + kPreprocessThreadCount + kDpuThreadCount + kPostprocessThreadCount);
-    threadsList.emplace_back(readFrame, argv[2], ref(fr));
-    threadsList.emplace_back(monitorQueues, ref(fr), ref(dpuIn), ref(dpuOut), ref(shw));
+        2 + kDecoderThreadCount + kReadFrameThreadCount +
+        kPreprocessThreadCount + kDpuThreadCount + kPostprocessThreadCount);
+    for (size_t i = 0; i < kDecoderThreadCount; ++i)
+    {
+        threadsList.emplace_back(decoderFrame, argv[2], ref(decoded));
+    }
+    threadsList.emplace_back(
+        monitorQueues, ref(decoded), ref(fr), ref(dpuIn), ref(dpuOut), ref(shw));
+    for (size_t i = 0; i < kReadFrameThreadCount; ++i)
+    {
+        threadsList.emplace_back(readFrame, ref(decoded), ref(fr));
+    }
     for (size_t i = 0; i < kPreprocessThreadCount; ++i)
     {
         threadsList.emplace_back(preprocessFrame, ref(fr), ref(dpuIn), inSize, input_scale);
