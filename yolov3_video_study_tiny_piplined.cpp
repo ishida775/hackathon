@@ -145,7 +145,11 @@ public:
         can_push_.notify_one();
         return value;
     }
-    int size() { return queue_.size(); }
+    size_type size()
+    {
+        std::unique_lock<std::mutex> guard(mtx_);
+        return queue_.size();
+    }
 };
 
 void readFrame(const char *fileName, concurrent_queue<imagePair> &out)
@@ -215,6 +219,7 @@ void displayFrame(concurrent_queue<imagePair> &in)
         auto dura = (duration_cast<microseconds>(show_time - start_time)).count();
         ++displayedCount;
         stringstream buffer;
+        // この式に変更は加えない.
         buffer << fixed << setprecision(1)
                << (float)pairIndexImg.first / (dura / 1000000.f);
         string a = buffer.str() + " FPS";
@@ -540,6 +545,23 @@ void postprocessFrame(
     }
 }
 
+void monitorQueues(
+    concurrent_queue<imagePair> &fr,
+    concurrent_queue<DpuInputFrame> &dpuIn,
+    concurrent_queue<DpuOutputFrame> &dpuOut,
+    concurrent_queue<imagePair> &shw)
+{
+    while (true)
+    {
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+        cout << "[queue] fr=" << fr.size()
+             << " dpuIn=" << dpuIn.size()
+             << " dpuOut=" << dpuOut.size()
+             << " shw=" << shw.size()
+             << endl;
+    }
+}
+
 int main(const int argc, const char **argv)
 {
     cout << "concurrency = " << std::thread::hardware_concurrency() << std::endl;
@@ -589,14 +611,15 @@ int main(const int argc, const char **argv)
     auto conf_output_scale =
         get_output_scale(runner->get_output_tensors()[output_mapping[1]]);
 
-    concurrent_queue<imagePair> fr(1), shw(1);
+    concurrent_queue<imagePair> fr(100), shw(100);
     concurrent_queue<DpuInputFrame> dpuIn(1);
     concurrent_queue<DpuOutputFrame> dpuOut(kPostprocessThreadCount);
 
     vector<thread> threadsList;
     threadsList.reserve(
-        2 + kPreprocessThreadCount + kDpuThreadCount + kPostprocessThreadCount);
+        3 + kPreprocessThreadCount + kDpuThreadCount + kPostprocessThreadCount);
     threadsList.emplace_back(readFrame, argv[2], ref(fr));
+    threadsList.emplace_back(monitorQueues, ref(fr), ref(dpuIn), ref(dpuOut), ref(shw));
     for (size_t i = 0; i < kPreprocessThreadCount; ++i)
     {
         threadsList.emplace_back(preprocessFrame, ref(fr), ref(dpuIn), inSize, input_scale);
