@@ -71,6 +71,9 @@ priority_queue<imagePair, vector<imagePair>, paircomp> queueShow; // priority qu
 
 GraphInfo shapes;
 constexpr size_t kYoloOutputCount = 2;
+constexpr size_t kPreprocessThreadCount = 1;
+constexpr size_t kDpuThreadCount = 1;
+constexpr size_t kPostprocessThreadCount = 2;
 TensorShape inshapes[1];
 TensorShape outshapes[kYoloOutputCount];
 
@@ -213,7 +216,7 @@ void displayFrame(concurrent_queue<imagePair> &in)
         ++displayedCount;
         stringstream buffer;
         buffer << fixed << setprecision(1)
-               << static_cast<float>(displayedCount) / (dura / 1000000.f);
+               << (float)pairIndexImg.first / (dura / 1000000.f);
         string a = buffer.str() + " FPS";
         putText(frame, a, cv::Point(10, 15), 1, 1, cv::Scalar{0, 0, 240}, 1);
         // cout << "FPS=" << buffer.str() << "\n" << flush;
@@ -473,7 +476,7 @@ void preprocessFrame(
         dpuInput.frame = pairIndexImage.second;
         dpuInput.input.resize(input_size);
         preprocess(dpuInput.frame, dpuInput.input.data(), input_scale);
-        out.push_drop_oldest(std::move(dpuInput));
+        out.push(std::move(dpuInput));
     }
 }
 
@@ -509,7 +512,7 @@ void runDPU(
             dpuInput.input.data(),
             output_data);
 
-        out.push_drop_oldest(std::move(dpuOutput));
+        out.push(std::move(dpuOutput));
     }
 }
 
@@ -586,22 +589,28 @@ int main(const int argc, const char **argv)
     auto conf_output_scale =
         get_output_scale(runner->get_output_tensors()[output_mapping[1]]);
 
-    concurrent_queue<imagePair> fr(4), shw(1);
-    concurrent_queue<DpuInputFrame> dpuIn(4);
-    concurrent_queue<DpuOutputFrame> dpuOut(4);
-    array<thread, 11> threadsList = {
-        thread(readFrame, argv[2], ref(fr)),
-        thread(preprocessFrame, ref(fr), ref(dpuIn), inSize, input_scale),
-        thread(preprocessFrame, ref(fr), ref(dpuIn), inSize, input_scale),
-        thread(preprocessFrame, ref(fr), ref(dpuIn), inSize, input_scale),
-        thread(preprocessFrame, ref(fr), ref(dpuIn), inSize, input_scale),
-        thread(runDPU, runner.get(), ref(dpuIn), ref(dpuOut)),
-        thread(postprocessFrame, ref(dpuOut), ref(shw), conf_output_scale, inHeight, inWidth),
-        thread(postprocessFrame, ref(dpuOut), ref(shw), conf_output_scale, inHeight, inWidth),
-        thread(postprocessFrame, ref(dpuOut), ref(shw), conf_output_scale, inHeight, inWidth),
-        thread(postprocessFrame, ref(dpuOut), ref(shw), conf_output_scale, inHeight, inWidth),
-        thread(displayFrame, ref(shw)),
-    };
+    concurrent_queue<imagePair> fr(1), shw(1);
+    concurrent_queue<DpuInputFrame> dpuIn(1);
+    concurrent_queue<DpuOutputFrame> dpuOut(kPostprocessThreadCount);
+
+    vector<thread> threadsList;
+    threadsList.reserve(
+        2 + kPreprocessThreadCount + kDpuThreadCount + kPostprocessThreadCount);
+    threadsList.emplace_back(readFrame, argv[2], ref(fr));
+    for (size_t i = 0; i < kPreprocessThreadCount; ++i)
+    {
+        threadsList.emplace_back(preprocessFrame, ref(fr), ref(dpuIn), inSize, input_scale);
+    }
+    for (size_t i = 0; i < kDpuThreadCount; ++i)
+    {
+        threadsList.emplace_back(runDPU, runner.get(), ref(dpuIn), ref(dpuOut));
+    }
+    for (size_t i = 0; i < kPostprocessThreadCount; ++i)
+    {
+        threadsList.emplace_back(
+            postprocessFrame, ref(dpuOut), ref(shw), conf_output_scale, inHeight, inWidth);
+    }
+    threadsList.emplace_back(displayFrame, ref(shw));
 
     for (auto &worker : threadsList)
     {
