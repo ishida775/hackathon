@@ -8,6 +8,7 @@
 #include <fstream>
 #include <iomanip>
 #include <chrono>
+#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <zconf.h>
@@ -41,6 +42,8 @@ using namespace std;
 using namespace cv;
 using namespace std::chrono;
 
+using Clock = std::chrono::system_clock;
+
 bool Lbox_on = false;
 
 chrono::system_clock::time_point start_time, end_time, pre_end_time, dpu_end_time;
@@ -49,7 +52,38 @@ int idxInputImage = 0; // frame index of input video
 int idxShowImage = 0;  // next frame index to be displayed
 bool bReading = true;  // flag of reding input frame
 
-typedef pair<int, Mat> imagePair;
+std::mutex log_mutex;
+
+struct FrameTimings
+{
+    int64_t read_frame_us = 0;
+    int64_t preprocess_frame_us = 0;
+    int64_t run_dpu_us = 0;
+    int64_t postprocess_frame_us = 0;
+    int64_t postprocess_us = 0;
+    int64_t display_frame_us = 0;
+};
+
+struct imagePair
+{
+    int first = 0;
+    Mat second;
+    FrameTimings timings;
+
+    imagePair() = default;
+    imagePair(int index, Mat frame) : first(index), second(std::move(frame)) {}
+};
+
+int64_t elapsed_us(const Clock::time_point &start, const Clock::time_point &end)
+{
+    return duration_cast<microseconds>(end - start).count();
+}
+
+double us_to_ms(int64_t us)
+{
+    return static_cast<double>(us) / 1000.0;
+}
+
 class paircomp
 {
 public:
@@ -74,6 +108,7 @@ constexpr size_t kYoloOutputCount = 2;
 constexpr size_t kPreprocessThreadCount = 1;
 constexpr size_t kDpuThreadCount = 1;
 constexpr size_t kPostprocessThreadCount = 2;
+constexpr int debug_period = 30;
 TensorShape inshapes[1];
 TensorShape outshapes[kYoloOutputCount];
 
@@ -172,14 +207,17 @@ void readFrame(const char *fileName, concurrent_queue<imagePair> &out)
         {
             // usleep(20000); // No performanec increase if 20000 --> 2000
             // auto start_readtime = chrono::system_clock::now();
+            auto read_start_time = Clock::now();
             Mat img;
             if (!video.read(img))
             {
                 break;
             }
 
-            auto pair = make_pair(idxInputImage++, img);
+            imagePair pair(idxInputImage++, std::move(img));
             end_time = chrono::system_clock::now();
+            auto read_end_time = Clock::now();
+            pair.timings.read_frame_us = elapsed_us(read_start_time, read_end_time);
             // cout << "\nread img time= " <<
             //	    std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_readtime).count()
             //	    << " [mS]" << endl;
@@ -215,6 +253,7 @@ void displayFrame(concurrent_queue<imagePair> &in)
             continue;
         }
 
+        auto display_start_time = Clock::now();
         auto show_time = chrono::system_clock::now();
         auto dura = (duration_cast<microseconds>(show_time - start_time)).count();
         ++displayedCount;
@@ -235,7 +274,27 @@ void displayFrame(concurrent_queue<imagePair> &in)
             exit(0);
         }
         //}
-        auto disp_end_time = chrono::system_clock::now();
+        auto display_end_time = Clock::now();
+        pairIndexImg.timings.display_frame_us =
+            elapsed_us(display_start_time, display_end_time);
+        if (debug_period > 0 && displayedCount % debug_period == 0)
+        {
+            std::unique_lock<std::mutex> guard(log_mutex);
+            cout << fixed << setprecision(3)
+                 << "[time] frame=" << index
+                 << " readFrame="
+                 << us_to_ms(pairIndexImg.timings.read_frame_us) << "ms"
+                 << " preprocessFrame="
+                 << us_to_ms(pairIndexImg.timings.preprocess_frame_us) << "ms"
+                 << " runDPU=" << us_to_ms(pairIndexImg.timings.run_dpu_us) << "ms"
+                 << " postprocessFrame="
+                 << us_to_ms(pairIndexImg.timings.postprocess_frame_us) << "ms"
+                 << " postprocess="
+                 << us_to_ms(pairIndexImg.timings.postprocess_us) << "ms"
+                 << " displayFrame="
+                 << us_to_ms(pairIndexImg.timings.display_frame_us) << "ms"
+                 << endl;
+        }
         // cout << "\ndisplay time= " <<
         //	    std::chrono::duration_cast<std::chrono::milliseconds>(disp_end_time - show_time).count()
         //      << " [mS]" << flush;
@@ -412,6 +471,7 @@ struct DpuInputFrame
     int index;
     Mat frame;
     vector<int8_t> input;
+    FrameTimings timings;
 };
 
 struct DpuOutputFrame
@@ -419,6 +479,7 @@ struct DpuOutputFrame
     int index;
     Mat frame;
     std::array<vector<int8_t>, kYoloOutputCount> output;
+    FrameTimings timings;
 };
 
 template <typename TensorList>
@@ -459,11 +520,19 @@ Mat postprocess(
     const GraphInfo &graph_info,
     float output_scale,
     int input_height,
-    int input_width)
+    int input_width,
+    FrameTimings *timings)
 {
+    auto postprocess_start_time = Clock::now();
     Mat img = frame.clone();
     vector<int8_t *> results(output_data.begin(), output_data.end());
     post_process(img, results, graph_info, output_scale, input_height, input_width);
+    auto postprocess_end_time = Clock::now();
+    if (timings != nullptr)
+    {
+        timings->postprocess_us =
+            elapsed_us(postprocess_start_time, postprocess_end_time);
+    }
     return img;
 }
 
@@ -476,11 +545,16 @@ void preprocessFrame(
     while (true)
     {
         auto pairIndexImage = in.pop();
+        auto preprocess_start_time = Clock::now();
         DpuInputFrame dpuInput;
         dpuInput.index = pairIndexImage.first;
         dpuInput.frame = pairIndexImage.second;
+        dpuInput.timings = pairIndexImage.timings;
         dpuInput.input.resize(input_size);
         preprocess(dpuInput.frame, dpuInput.input.data(), input_scale);
+        auto preprocess_end_time = Clock::now();
+        dpuInput.timings.preprocess_frame_us =
+            elapsed_us(preprocess_start_time, preprocess_end_time);
         out.push(std::move(dpuInput));
     }
 }
@@ -497,9 +571,11 @@ void runDPU(
     while (true)
     {
         auto dpuInput = in.pop();
+        auto run_dpu_start_time = Clock::now();
         DpuOutputFrame dpuOutput;
         dpuOutput.index = dpuInput.index;
         dpuOutput.frame = dpuInput.frame;
+        dpuOutput.timings = dpuInput.timings;
 
         for (size_t i = 0; i < dpuOutput.output.size(); ++i)
         {
@@ -517,6 +593,9 @@ void runDPU(
             dpuInput.input.data(),
             output_data);
 
+        auto run_dpu_end_time = Clock::now();
+        dpuOutput.timings.run_dpu_us =
+            elapsed_us(run_dpu_start_time, run_dpu_end_time);
         out.push(std::move(dpuOutput));
     }
 }
@@ -531,6 +610,7 @@ void postprocessFrame(
     while (true)
     {
         auto dpuOutput = in.pop();
+        auto postprocess_frame_start_time = Clock::now();
         std::array<int8_t *, kYoloOutputCount> output_data = {
             dpuOutput.output[0].data(),
             dpuOutput.output[1].data()};
@@ -540,8 +620,15 @@ void postprocessFrame(
             shapes,
             output_scale,
             input_height,
-            input_width);
-        out.push_drop_oldest(make_pair(dpuOutput.index, img));
+            input_width,
+            &dpuOutput.timings);
+        auto postprocess_frame_end_time = Clock::now();
+
+        imagePair pair(dpuOutput.index, std::move(img));
+        pair.timings = dpuOutput.timings;
+        pair.timings.postprocess_frame_us =
+            elapsed_us(postprocess_frame_start_time, postprocess_frame_end_time);
+        out.push_drop_oldest(std::move(pair));
     }
 }
 
@@ -554,6 +641,7 @@ void monitorQueues(
     while (true)
     {
         std::this_thread::sleep_for(std::chrono::seconds(1));
+        std::unique_lock<std::mutex> guard(log_mutex);
         cout << "[queue] fr=" << fr.size()
              << " dpuIn=" << dpuIn.size()
              << " dpuOut=" << dpuOut.size()
