@@ -70,8 +70,9 @@ queue<pair<int, Mat>> queueInput; // queue of FIFO
 priority_queue<imagePair, vector<imagePair>, paircomp> queueShow; // priority queue by index comp.
 
 GraphInfo shapes;
+constexpr size_t kYoloOutputCount = 2;
 TensorShape inshapes[1];
-TensorShape outshapes[3];
+TensorShape outshapes[kYoloOutputCount];
 
 template <typename T>
 class concurrent_queue
@@ -107,13 +108,35 @@ public:
         can_pop_.notify_one();
     }
 
+    void push(T &&value)
+    {
+        std::unique_lock<std::mutex> guard(mtx_);
+        // wait 'can set'
+        can_push_.wait(guard, [this]()
+                       { return queue_.size() < capacity_; });
+        queue_.push(std::move(value));
+        // notify 'can get'
+        can_pop_.notify_one();
+    }
+
+    void push_drop_oldest(T value)
+    {
+        std::unique_lock<std::mutex> guard(mtx_);
+        if (queue_.size() >= capacity_)
+        {
+            queue_.pop();
+        }
+        queue_.push(std::move(value));
+        can_pop_.notify_one();
+    }
+
     T pop()
     {
         std::unique_lock<std::mutex> guard(mtx_);
         // wait 'can get'
         can_pop_.wait(guard, [this]()
                       { return !queue_.empty(); });
-        T value = queue_.front();
+        T value = std::move(queue_.front());
         queue_.pop();
         // notify 'can set'
         can_push_.notify_one();
@@ -153,7 +176,7 @@ void readFrame(const char *fileName, concurrent_queue<imagePair> &out)
             // cout << "\nread img time= " <<
             //	    std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_readtime).count()
             //	    << " [mS]" << endl;
-            out.push(pair);
+            out.push_drop_oldest(std::move(pair));
             // cout << "index=" << idxInputImage << "\n" << flush;
             // cout << "q size=" << queueInput.size() << "\n" << flush;
         }
@@ -167,11 +190,19 @@ void displayFrame(concurrent_queue<imagePair> &in)
 {
     Mat frame;
     int index;
+    int latestIndex = -1;
+    int displayedCount = 0;
     while (true)
     {
         auto pairIndexImg = in.pop();
         frame = pairIndexImg.second;
         index = pairIndexImg.first;
+        if (index <= latestIndex)
+        {
+            continue;
+        }
+        latestIndex = index;
+
         if (frame.rows <= 0 || frame.cols <= 0)
         {
             continue;
@@ -179,9 +210,10 @@ void displayFrame(concurrent_queue<imagePair> &in)
 
         auto show_time = chrono::system_clock::now();
         auto dura = (duration_cast<microseconds>(show_time - start_time)).count();
+        ++displayedCount;
         stringstream buffer;
         buffer << fixed << setprecision(1)
-               << (float)pairIndexImg.first / (dura / 1000000.f);
+               << static_cast<float>(displayedCount) / (dura / 1000000.f);
         string a = buffer.str() + " FPS";
         putText(frame, a, cv::Point(10, 15), 1, 1, cv::Scalar{0, 0, 240}, 1);
         // cout << "FPS=" << buffer.str() << "\n" << flush;
@@ -219,7 +251,7 @@ void write_output(const string &name, const int8_t *result, const int &size0)
 void post_process(Mat &img, const vector<int8_t *> &out, const GraphInfo &shapes,
                   const float &scale, const int &sHeight, const int &sWidth)
 {
-    // sHeight, sWidth = 416, 416
+    // sHeight and sWidth come from the xmodel input tensor.
     vector<vector<float>> boxes;
     char fname[256];
     for (size_t i = 0; i < out.size(); i++)
@@ -295,7 +327,7 @@ void post_process(Mat &img, const vector<int8_t *> &out, const GraphInfo &shapes
     }
 }
 
-void setInputImageForYOLO(vart::Runner *runner, const Mat &frame, int8_t *data,
+void setInputImageForYOLO(const Mat &frame, int8_t *data,
                           float input_scale)
 {
     Mat img_copy;
@@ -329,7 +361,7 @@ void setInputImageForYOLO(vart::Runner *runner, const Mat &frame, int8_t *data,
     free_image(img_yolo);
 }
 
-void setInputPointer(vart::Runner *runner, const Mat &frame, int8_t *data,
+void setInputPointer(const Mat &frame, int8_t *data,
                      float scale)
 {
     int width = shapes.inTensorList[0].width;
@@ -353,20 +385,33 @@ void setInputPointer(vart::Runner *runner, const Mat &frame, int8_t *data,
 }
 
 void preprocess(
-    vart::Runner *runner,
     const Mat &frame,
     int8_t *input_data,
     float input_scale)
 {
     if (Lbox_on)
     {
-        setInputImageForYOLO(runner, frame, input_data, input_scale);
+        setInputImageForYOLO(frame, input_data, input_scale);
     }
     else
     {
-        setInputPointer(runner, frame, input_data, input_scale);
+        setInputPointer(frame, input_data, input_scale);
     }
 }
+
+struct DpuInputFrame
+{
+    int index;
+    Mat frame;
+    vector<int8_t> input;
+};
+
+struct DpuOutputFrame
+{
+    int index;
+    Mat frame;
+    std::array<vector<int8_t>, kYoloOutputCount> output;
+};
 
 template <typename TensorList>
 void run_dpu(
@@ -375,7 +420,7 @@ void run_dpu(
     const TensorList &output_tensors,
     const vector<int> &output_mapping,
     int8_t *input_data,
-    const std::array<int8_t *, 3> &output_data)
+    const std::array<int8_t *, kYoloOutputCount> &output_data)
 {
     std::vector<std::unique_ptr<vart::TensorBuffer>> inputs;
     std::vector<std::unique_ptr<vart::TensorBuffer>> outputs;
@@ -402,7 +447,7 @@ void run_dpu(
 
 Mat postprocess(
     const Mat &frame,
-    const std::array<int8_t *, 3> &output_data,
+    const std::array<int8_t *, kYoloOutputCount> &output_data,
     const GraphInfo &graph_info,
     float output_scale,
     int input_height,
@@ -414,106 +459,82 @@ Mat postprocess(
     return img;
 }
 
-void runYOLO(vart::Runner *runner, concurrent_queue<imagePair> &in, concurrent_queue<imagePair> &out)
+void preprocessFrame(
+    concurrent_queue<imagePair> &in,
+    concurrent_queue<DpuInputFrame> &out,
+    int input_size,
+    float input_scale)
 {
-
-    auto inputTensors = cloneTensorBuffer(runner->get_input_tensors());
-    auto outputTensors = cloneTensorBuffer(runner->get_output_tensors());
-
-    // set input pointer
-    int inHeight = shapes.inTensorList[0].height;
-    int inWidth = shapes.inTensorList[0].width;
-    int inChannel = 3; // fixed
-    int batchSize = 1; // fixed
-    int inSize = inHeight * inWidth * inChannel;
-    int8_t *imageInputs = new int8_t[inSize * batchSize];
-
-    /*
-    cout << "in_height = " << inHeight << endl;
-    cout << "in_width = " << inWidth << endl;
-    cout << "in_channel = " << inChannel << endl;
-    cout << "batch size = " << batchSize << endl;
-    cout << "\n";
-    */
-    // set output pointer
-    vector<int> output_mapping = shapes.output_mapping;
-    auto conf_output_scale =
-        get_output_scale(runner->get_output_tensors()[output_mapping[1]]);
-
-    // make output vector
-    const int size0 = shapes.outTensorList[0].size;
-    // cout << "size0 = " << size0 << endl; // debug
-    int8_t *result0 = new int8_t[size0 * batchSize];
-    const int size1 = shapes.outTensorList[1].size;
-    // cout << "size1 = " << size1 << endl; // debug
-    int8_t *result1 = new int8_t[size1 * batchSize];
-    const int size2 = shapes.outTensorList[2].size;
-    // cout << "size2 = " << size2 << endl; // debug
-    int8_t *result2 = new int8_t[size2 * batchSize];
-    std::array<int8_t *, 3> output_data = {result0, result1, result2};
-
-    auto input_scale = get_input_scale(runner->get_input_tensors()[0]);
-
     while (true)
     {
         auto pairIndexImage = in.pop();
-        auto yolo_start_time = std::chrono::system_clock::now(); // runYOLO starttime
+        DpuInputFrame dpuInput;
+        dpuInput.index = pairIndexImage.first;
+        dpuInput.frame = pairIndexImage.second;
+        dpuInput.input.resize(input_size);
+        preprocess(dpuInput.frame, dpuInput.input.data(), input_scale);
+        out.push_drop_oldest(std::move(dpuInput));
+    }
+}
 
-        preprocess(runner, pairIndexImage.second, imageInputs, input_scale);
-        // pre_end_time = std::chrono::system_clock::now();
+void runDPU(
+    vart::Runner *runner,
+    concurrent_queue<DpuInputFrame> &in,
+    concurrent_queue<DpuOutputFrame> &out)
+{
+    auto inputTensors = cloneTensorBuffer(runner->get_input_tensors());
+    auto outputTensors = cloneTensorBuffer(runner->get_output_tensors());
+    vector<int> output_mapping = shapes.output_mapping;
 
+    while (true)
+    {
+        auto dpuInput = in.pop();
+        DpuOutputFrame dpuOutput;
+        dpuOutput.index = dpuInput.index;
+        dpuOutput.frame = dpuInput.frame;
+
+        for (size_t i = 0; i < dpuOutput.output.size(); ++i)
+        {
+            dpuOutput.output[i].resize(shapes.outTensorList[i].size);
+        }
+
+        std::array<int8_t *, kYoloOutputCount> output_data = {
+            dpuOutput.output[0].data(),
+            dpuOutput.output[1].data()};
         run_dpu(
             runner,
             inputTensors,
             outputTensors,
             output_mapping,
-            imageInputs,
+            dpuInput.input.data(),
             output_data);
-        // cout << "Done execution" << endl; // debug
 
-        // dpu_end_time = std::chrono::system_clock::now();
+        out.push_drop_oldest(std::move(dpuOutput));
+    }
+}
 
-        // check output
-        /* debug
-        write_output("out0.bin", result0, size0);
-        write_output("out1.bin", result1, size1);
-        write_output("out2.bin", result2, size2);
-        */
-        pairIndexImage.second = postprocess(
-            pairIndexImage.second,
+void postprocessFrame(
+    concurrent_queue<DpuOutputFrame> &in,
+    concurrent_queue<imagePair> &out,
+    float output_scale,
+    int input_height,
+    int input_width)
+{
+    while (true)
+    {
+        auto dpuOutput = in.pop();
+        std::array<int8_t *, kYoloOutputCount> output_data = {
+            dpuOutput.output[0].data(),
+            dpuOutput.output[1].data()};
+        Mat img = postprocess(
+            dpuOutput.frame,
             output_data,
             shapes,
-            conf_output_scale,
-            inHeight,
-            inWidth);
-        // cv::imwrite("result.jpg", image2);
-        out.push(pairIndexImage);
-        auto yolo_end_time = std::chrono::system_clock::now();
-        // cout << "\nrunYOLO time= " <<
-        //    std::chrono::duration_cast<std::chrono::milliseconds>(yolo_end_time - yolo_start_time).count()
-        //    << " [mS]" << endl;
+            output_scale,
+            input_height,
+            input_width);
+        out.push_drop_oldest(make_pair(dpuOutput.index, img));
     }
-    delete[] imageInputs;
-    delete[] result0;
-    delete[] result1;
-    delete[] result2;
-
-    /*
-    cout << "\npre_process time = " <<
-        std::chrono::duration_cast<std::chrono::milliseconds>(pre_end_time - start_time).count()
-        << " [mS]" << endl;
-    cout << "DPU time = " <<
-        std::chrono::duration_cast<std::chrono::milliseconds>(dpu_end_time - pre_end_time).count()
-        << " [mS]" << endl;
-    cout << "post_process time = " <<
-        std::chrono::duration_cast<std::chrono::milliseconds>(end_time - dpu_end_time).count()
-        << " [mS]" << endl;
-    cout << "-------------------------------------------" << endl;
-    cout << "total proc. time = " <<
-        std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count()
-        << " [mS]" << endl;
-
-    cout << "\nDone yolov3." << endl;*/
 }
 
 int main(const int argc, const char **argv)
@@ -535,14 +556,7 @@ int main(const int argc, const char **argv)
         << "yolov3 should have one and only one dpu subgraph." << endl;
     cout << "create running for subgraph: " << subgraph[0]->get_name() << endl;
 
-    auto attrs = xir::Attrs::create();
     auto runner =
-        vart::Runner::create_runner(subgraph[0], "run");
-    auto runner1 =
-        vart::Runner::create_runner(subgraph[0], "run");
-    auto runner2 =
-        vart::Runner::create_runner(subgraph[0], "run");
-    auto runner3 =
         vart::Runner::create_runner(subgraph[0], "run");
     // auto runner = vart::Runner::create_runner(subgraph[0], "run");
     // start_time = chrono::system_clock::now();
@@ -553,23 +567,45 @@ int main(const int argc, const char **argv)
     //  get in/out tenosrs
     int inputCnt = inputTensors.size();
     int outputCnt = outputTensors.size();
+    CHECK_EQ(outputCnt, static_cast<int>(kYoloOutputCount))
+        << "yolov3-tiny should have two output tensors." << endl;
     TensorShape inshapes[inputCnt];
     TensorShape outshapes[outputCnt];
     shapes.inTensorList = inshapes;
     shapes.outTensorList = outshapes; // get output size
     getTensorShape(runner.get(), &shapes, inputCnt, outputCnt);
+    CHECK_EQ(shapes.output_mapping.size(), kYoloOutputCount)
+        << "yolov3-tiny output mapping should have two entries." << endl;
 
-    concurrent_queue<imagePair> fr(100), shw(100);
-    array<thread, 4> threadsList = {
+    const int inHeight = shapes.inTensorList[0].height;
+    const int inWidth = shapes.inTensorList[0].width;
+    const int batchSize = 1; // fixed
+    const int inSize = shapes.inTensorList[0].size * batchSize;
+    auto input_scale = get_input_scale(runner->get_input_tensors()[0]);
+    vector<int> output_mapping = shapes.output_mapping;
+    auto conf_output_scale =
+        get_output_scale(runner->get_output_tensors()[output_mapping[1]]);
+
+    concurrent_queue<imagePair> fr(4), shw(1);
+    concurrent_queue<DpuInputFrame> dpuIn(4);
+    concurrent_queue<DpuOutputFrame> dpuOut(4);
+    array<thread, 11> threadsList = {
         thread(readFrame, argv[2], ref(fr)),
+        thread(preprocessFrame, ref(fr), ref(dpuIn), inSize, input_scale),
+        thread(preprocessFrame, ref(fr), ref(dpuIn), inSize, input_scale),
+        thread(preprocessFrame, ref(fr), ref(dpuIn), inSize, input_scale),
+        thread(preprocessFrame, ref(fr), ref(dpuIn), inSize, input_scale),
+        thread(runDPU, runner.get(), ref(dpuIn), ref(dpuOut)),
+        thread(postprocessFrame, ref(dpuOut), ref(shw), conf_output_scale, inHeight, inWidth),
+        thread(postprocessFrame, ref(dpuOut), ref(shw), conf_output_scale, inHeight, inWidth),
+        thread(postprocessFrame, ref(dpuOut), ref(shw), conf_output_scale, inHeight, inWidth),
+        thread(postprocessFrame, ref(dpuOut), ref(shw), conf_output_scale, inHeight, inWidth),
         thread(displayFrame, ref(shw)),
-        thread(runYOLO, runner.get(), ref(fr), ref(shw)),
-        thread(runYOLO, runner1.get(), ref(fr), ref(shw)),
     };
 
-    for (int i = 0; i < 4; i++)
+    for (auto &worker : threadsList)
     {
-        threadsList[i].join();
+        worker.join();
     }
 
     return 0;

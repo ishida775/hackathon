@@ -1,5 +1,4 @@
 #include <algorithm>
-#include <array>
 #include <vector>
 #include <atomic>
 #include <queue>
@@ -8,7 +7,6 @@
 #include <fstream>
 #include <iomanip>
 #include <chrono>
-#include <memory>
 #include <mutex>
 #include <zconf.h>
 #include <thread>
@@ -330,7 +328,7 @@ void setInputImageForYOLO(vart::Runner *runner, const Mat &frame, int8_t *data,
 }
 
 void setInputPointer(vart::Runner *runner, const Mat &frame, int8_t *data,
-                     float scale)
+                     const int &scale)
 {
     int width = shapes.inTensorList[0].width;
     int height = shapes.inTensorList[0].height;
@@ -346,72 +344,10 @@ void setInputPointer(vart::Runner *runner, const Mat &frame, int8_t *data,
     for (int i = 0; i < size; ++i)
     {
         float dataf = static_cast<float>(imdata[i]);
-        data[i] = static_cast<int8_t>(dataf * scale / 256.0f);
+        data[i] = static_cast<int>((dataf * static_cast<float>(scale) / 256.0));
         if (data[i] < 0)
             data[i] = 127;
     }
-}
-
-void preprocess(
-    vart::Runner *runner,
-    const Mat &frame,
-    int8_t *input_data,
-    float input_scale)
-{
-    if (Lbox_on)
-    {
-        setInputImageForYOLO(runner, frame, input_data, input_scale);
-    }
-    else
-    {
-        setInputPointer(runner, frame, input_data, input_scale);
-    }
-}
-
-template <typename TensorList>
-void run_dpu(
-    vart::Runner *runner,
-    const TensorList &input_tensors,
-    const TensorList &output_tensors,
-    const vector<int> &output_mapping,
-    int8_t *input_data,
-    const std::array<int8_t *, 3> &output_data)
-{
-    std::vector<std::unique_ptr<vart::TensorBuffer>> inputs;
-    std::vector<std::unique_ptr<vart::TensorBuffer>> outputs;
-    std::vector<vart::TensorBuffer *> inputsPtr;
-    std::vector<vart::TensorBuffer *> outputsPtr;
-
-    inputs.push_back(std::make_unique<CpuFlatTensorBuffer>(
-        input_data, input_tensors[0].get()));
-    for (size_t i = 0; i < output_data.size(); ++i)
-    {
-        outputs.push_back(std::make_unique<CpuFlatTensorBuffer>(
-            output_data[i], output_tensors[output_mapping[i]].get()));
-    }
-
-    inputsPtr.push_back(inputs[0].get());
-    for (auto &output : outputs)
-    {
-        outputsPtr.push_back(output.get());
-    }
-
-    auto job_id = runner->execute_async(inputsPtr, outputsPtr);
-    runner->wait(job_id.first, -1);
-}
-
-Mat postprocess(
-    const Mat &frame,
-    const std::array<int8_t *, 3> &output_data,
-    const GraphInfo &graph_info,
-    float output_scale,
-    int input_height,
-    int input_width)
-{
-    Mat img = frame.clone();
-    vector<int8_t *> results(output_data.begin(), output_data.end());
-    post_process(img, results, graph_info, output_scale, input_height, input_width);
-    return img;
 }
 
 void runYOLO(vart::Runner *runner, concurrent_queue<imagePair> &in, concurrent_queue<imagePair> &out)
@@ -450,25 +386,44 @@ void runYOLO(vart::Runner *runner, concurrent_queue<imagePair> &in, concurrent_q
     const int size2 = shapes.outTensorList[2].size;
     // cout << "size2 = " << size2 << endl; // debug
     int8_t *result2 = new int8_t[size2 * batchSize];
-    std::array<int8_t *, 3> output_data = {result0, result1, result2};
 
     auto input_scale = get_input_scale(runner->get_input_tensors()[0]);
+    float mean[3] = {0, 0, 0};
 
+    std::vector<std::unique_ptr<vart::TensorBuffer>> inputs, outputs;
+    std::vector<vart::TensorBuffer *> inputsPtr, outputsPtr;
     while (true)
     {
         auto pairIndexImage = in.pop();
         auto yolo_start_time = std::chrono::system_clock::now(); // runYOLO starttime
 
-        preprocess(runner, pairIndexImage.second, imageInputs, input_scale);
+        if (Lbox_on)
+        {
+            setInputImageForYOLO(runner, pairIndexImage.second, imageInputs, input_scale);
+        }
+        else
+        {
+            setInputPointer(runner, pairIndexImage.second, imageInputs, input_scale);
+        }
+
+        // preparation for execute
+        inputs.push_back(std::make_unique<CpuFlatTensorBuffer>(
+            imageInputs, inputTensors[0].get()));
+        outputs.push_back(std::make_unique<CpuFlatTensorBuffer>(
+            result0, outputTensors[output_mapping[0]].get()));
+        outputs.push_back(std::make_unique<CpuFlatTensorBuffer>(
+            result1, outputTensors[output_mapping[1]].get()));
+        outputs.push_back(std::make_unique<CpuFlatTensorBuffer>(
+            result2, outputTensors[output_mapping[2]].get()));
+
+        inputsPtr.push_back(inputs[0].get());
+        outputsPtr.push_back(outputs[0].get());
+        outputsPtr.push_back(outputs[1].get());
+        outputsPtr.push_back(outputs[2].get());
         // pre_end_time = std::chrono::system_clock::now();
 
-        run_dpu(
-            runner,
-            inputTensors,
-            outputTensors,
-            output_mapping,
-            imageInputs,
-            output_data);
+        auto job_id = runner->execute_async(inputsPtr, outputsPtr);
+        runner->wait(job_id.first, -1);
         // cout << "Done execution" << endl; // debug
 
         // dpu_end_time = std::chrono::system_clock::now();
@@ -479,19 +434,19 @@ void runYOLO(vart::Runner *runner, concurrent_queue<imagePair> &in, concurrent_q
         write_output("out1.bin", result1, size1);
         write_output("out2.bin", result2, size2);
         */
-        pairIndexImage.second = postprocess(
-            pairIndexImage.second,
-            output_data,
-            shapes,
-            conf_output_scale,
-            inHeight,
-            inWidth);
+        vector<int8_t *> results = {result0, result1, result2};
+        post_process(pairIndexImage.second, results, shapes, conf_output_scale, inHeight, inWidth);
         // cv::imwrite("result.jpg", image2);
         out.push(pairIndexImage);
         auto yolo_end_time = std::chrono::system_clock::now();
         // cout << "\nrunYOLO time= " <<
         //    std::chrono::duration_cast<std::chrono::milliseconds>(yolo_end_time - yolo_start_time).count()
         //    << " [mS]" << endl;
+
+        inputs.clear();
+        outputs.clear();
+        inputsPtr.clear();
+        outputsPtr.clear();
     }
     delete[] imageInputs;
     delete[] result0;
@@ -559,7 +514,7 @@ int main(const int argc, const char **argv)
     shapes.outTensorList = outshapes; // get output size
     getTensorShape(runner.get(), &shapes, inputCnt, outputCnt);
 
-    concurrent_queue<imagePair> fr(100), shw(100);
+    concurrent_queue<imagePair> fr(30), shw(30);
     array<thread, 4> threadsList = {
         thread(readFrame, argv[2], ref(fr)),
         thread(displayFrame, ref(shw)),
