@@ -70,8 +70,9 @@ queue<pair<int, Mat>> queueInput; // queue of FIFO
 priority_queue<imagePair, vector<imagePair>, paircomp> queueShow; // priority queue by index comp.
 
 GraphInfo shapes;
+constexpr size_t kYoloOutputCount = 2;
 TensorShape inshapes[1];
-TensorShape outshapes[3];
+TensorShape outshapes[kYoloOutputCount];
 
 template <typename T>
 class concurrent_queue
@@ -230,7 +231,7 @@ void write_output(const string &name, const int8_t *result, const int &size0)
 void post_process(Mat &img, const vector<int8_t *> &out, const GraphInfo &shapes,
                   const float &scale, const int &sHeight, const int &sWidth)
 {
-    // sHeight, sWidth = 416, 416
+    // sHeight and sWidth come from the xmodel input tensor.
     vector<vector<float>> boxes;
     char fname[256];
     for (size_t i = 0; i < out.size(); i++)
@@ -389,7 +390,7 @@ struct DpuOutputFrame
 {
     int index;
     Mat frame;
-    std::array<vector<int8_t>, 3> output;
+    std::array<vector<int8_t>, kYoloOutputCount> output;
 };
 
 template <typename TensorList>
@@ -399,7 +400,7 @@ void run_dpu(
     const TensorList &output_tensors,
     const vector<int> &output_mapping,
     int8_t *input_data,
-    const std::array<int8_t *, 3> &output_data)
+    const std::array<int8_t *, kYoloOutputCount> &output_data)
 {
     std::vector<std::unique_ptr<vart::TensorBuffer>> inputs;
     std::vector<std::unique_ptr<vart::TensorBuffer>> outputs;
@@ -426,7 +427,7 @@ void run_dpu(
 
 Mat postprocess(
     const Mat &frame,
-    const std::array<int8_t *, 3> &output_data,
+    const std::array<int8_t *, kYoloOutputCount> &output_data,
     const GraphInfo &graph_info,
     float output_scale,
     int input_height,
@@ -477,10 +478,9 @@ void runDPU(
             dpuOutput.output[i].resize(shapes.outTensorList[i].size);
         }
 
-        std::array<int8_t *, 3> output_data = {
+        std::array<int8_t *, kYoloOutputCount> output_data = {
             dpuOutput.output[0].data(),
-            dpuOutput.output[1].data(),
-            dpuOutput.output[2].data()};
+            dpuOutput.output[1].data()};
         run_dpu(
             runner,
             inputTensors,
@@ -503,10 +503,9 @@ void postprocessFrame(
     while (true)
     {
         auto dpuOutput = in.pop();
-        std::array<int8_t *, 3> output_data = {
+        std::array<int8_t *, kYoloOutputCount> output_data = {
             dpuOutput.output[0].data(),
-            dpuOutput.output[1].data(),
-            dpuOutput.output[2].data()};
+            dpuOutput.output[1].data()};
         Mat img = postprocess(
             dpuOutput.frame,
             output_data,
@@ -555,11 +554,15 @@ int main(const int argc, const char **argv)
     //  get in/out tenosrs
     int inputCnt = inputTensors.size();
     int outputCnt = outputTensors.size();
+    CHECK_EQ(outputCnt, static_cast<int>(kYoloOutputCount))
+        << "yolov3-tiny should have two output tensors." << endl;
     TensorShape inshapes[inputCnt];
     TensorShape outshapes[outputCnt];
     shapes.inTensorList = inshapes;
     shapes.outTensorList = outshapes; // get output size
     getTensorShape(runner.get(), &shapes, inputCnt, outputCnt);
+    CHECK_EQ(shapes.output_mapping.size(), kYoloOutputCount)
+        << "yolov3-tiny output mapping should have two entries." << endl;
 
     const int inHeight = shapes.inTensorList[0].height;
     const int inWidth = shapes.inTensorList[0].width;
