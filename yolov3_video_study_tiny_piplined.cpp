@@ -762,6 +762,13 @@ int main(const int argc, const char **argv)
     CHECK_EQ(outputCnt, static_cast<int>(kYoloOutputCount))
         << "yolov3-tiny should have two output tensors." << endl;
 
+    // xmodelからスケール用の情報を取得.
+    auto input_scale =
+        get_input_scale(runner->get_input_tensors()[0]);
+    cerr << "input_scale = "
+         << input_scale
+         << endl;
+
     //
     TensorShape inshapes[inputCnt];
     TensorShape outshapes[outputCnt];
