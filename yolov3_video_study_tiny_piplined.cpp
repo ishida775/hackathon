@@ -38,6 +38,9 @@
 #include "common.h"
 #include "utils.h"
 
+#include <sstream>
+#include <stdexcept>
+
 using namespace std;
 using namespace cv;
 using namespace std::chrono;
@@ -656,7 +659,15 @@ void displayFrame(concurrent_queue<imagePair> &in)
         buffer << fixed << setprecision(1)
                << (float)pairIndexImg.first / (dura / 1000000.f);
         string a = buffer.str() + " FPS";
-        putText(frame, a, cv::Point(10, 15), 1, 1, cv::Scalar{0, 0, 240}, 1);
+        putText(
+            frame,
+            a,
+            cv::Point(20, 50),
+            cv::FONT_HERSHEY_SIMPLEX,
+            1.5,
+            cv::Scalar(0, 0, 255),
+            3,
+            cv::LINE_AA);
         imshow("YOLOv3 Detection@Xilinx DPU", frame);
         auto key = waitKey(1);
         if (key == 27)
