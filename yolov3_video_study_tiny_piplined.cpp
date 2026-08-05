@@ -372,7 +372,8 @@ void setInputPointer(const Mat &frame, int8_t *data, float scale)
     const int size = shapes.inTensorList[0].size;
 
     Mat resized;
-    cv::resize(frame, resized, Size(width, height), 0, 0, cv::INTER_LINEAR);
+    // cv::resize(frame, resized, Size(width, height), 0, 0, cv::INTER_LINEAR);
+    cv::resize(frame, resized, Size(width, height), 0, 0, cv::INTER_NEAREST);
     cv::cvtColor(resized, resized, cv::COLOR_BGR2RGB);
 
     const unsigned char *src = resized.data;
@@ -496,8 +497,6 @@ void DPUFrame(
         // dpuInキューからDpuInputFrameを取得.
         auto dpuInput = in.pop();
 
-        auto run_dpu_start_time = Clock::now();
-
         // 出力用の構造体の作成.
         DpuOutputFrame dpuOutput;
         dpuOutput.index = dpuInput.index;
@@ -514,6 +513,9 @@ void DPUFrame(
         std::array<int8_t *, kYoloOutputCount> output_data = {
             dpuOutput.output[0].data(),
             dpuOutput.output[1].data()};
+
+        auto run_dpu_start_time = Clock::now();
+
         run_dpu(
             runner,
             inputTensors,
