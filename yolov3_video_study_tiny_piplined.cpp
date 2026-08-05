@@ -372,24 +372,23 @@ void setInputPointer(const Mat &frame, int8_t *data)
     const int size = shapes.inTensorList[0].size;
 
     Mat resized;
-    // cv::resize(frame, resized, Size(width, height), 0, 0, cv::INTER_LINEAR);
-    cv::resize(frame, resized, Size(width, height), 0, 0, cv::INTER_NEAREST);
-    cv::cvtColor(resized, resized, cv::COLOR_BGR2RGB);
+    cv::resize(
+        frame,
+        resized,
+        Size(width, height),
+        0,
+        0,
+        cv::INTER_NEAREST);
 
-    const unsigned char *src = resized.data;
-    // const float qscale = scale / 256.0f;
+    const uint8_t *src = resized.data;
 
-    // for (int i = 0; i < size; ++i)
-    // {
-    //     data[i] = static_cast<int8_t>(src[i] * qscale);
-    //     if (data[i] < 0)
-    //         data[i] = 127;
-    // }
-
-    // input scaleが64を前提として正規化する.
-    for (int i = 0; i < size; ++i)
+    // resizedはBGR順、DPU入力はRGB順。
+    // input_scale=64なので、pixel * 64 / 256 = pixel >> 2。
+    for (int i = 0; i < size; i += 3)
     {
-        data[i] = static_cast<int8_t>(src[i] >> 2);
+        data[i + 0] = static_cast<int8_t>(src[i + 2] >> 2); // R
+        data[i + 1] = static_cast<int8_t>(src[i + 1] >> 2); // G
+        data[i + 2] = static_cast<int8_t>(src[i + 0] >> 2); // B
     }
 }
 
@@ -400,7 +399,7 @@ void preprocess(
 {
     if (Lbox_on)
     {
-        setInputImageForYOLO(frame, input_data);
+        // setInputImageForYOLO(frame, input_data);
     }
     else
     {
@@ -786,7 +785,7 @@ int main(const int argc, const char **argv)
     cerr << "input_scale = "
          << input_scale
          << endl;
-    // input scaleが64を前提としてpreprocessのコードを組んでいるため,
+    // input scaleが64のモデルを前提としてpreprocessのコードを組んでいるため,
     // それ以外の値が設定されている場合はエラーとする.
     constexpr float expected_input_scale = 64.0f;
     constexpr float tolerance = 1.0e-4f;
