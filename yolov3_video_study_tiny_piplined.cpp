@@ -338,28 +338,49 @@ void setInputImageForYOLO(const Mat &frame, int8_t *data,
 
 // Mat画像をDPUが受け取るin8_t型に変換する関数.
 // preprocessの中身.
-void setInputPointer(const Mat &frame, int8_t *data,
-                     float scale)
+// void setInputPointer(const Mat &frame, int8_t *data,
+//                      float scale)
+// {
+//     // 入力したxmodelのtensorのサイズを取得.
+//     int width = shapes.inTensorList[0].width;
+//     int height = shapes.inTensorList[0].height;
+//     int size = shapes.inTensorList[0].size;
+
+//     // 表示用にコピー.
+//     Mat img = frame.clone();
+
+//     // BGR=>RGBに変換して,リサイズする.
+//     cvtColor(img, img, cv::COLOR_BGR2RGB);
+//     Mat image2 = cv::Mat(height, width, CV_8SC3); // CV_8SC3 means 3ch singed char data type
+//     cv::resize(img, image2, Size(width, height), 0, 0, cv::INTER_LINEAR);
+
+//     // 画像の各pixelをint8_t型に変換する.
+//     unsigned char *imdata = image2.data;
+//     for (int i = 0; i < size; ++i)
+//     {
+//         float dataf = static_cast<float>(imdata[i]);
+//         data[i] = static_cast<int8_t>(dataf * scale / 256.0f);
+//         if (data[i] < 0)
+//             data[i] = 127;
+//     }
+// }
+
+void setInputPointer(const Mat &frame, int8_t *data, float scale)
 {
-    // 入力したxmodelのtensorのサイズを取得.
-    int width = shapes.inTensorList[0].width;
-    int height = shapes.inTensorList[0].height;
-    int size = shapes.inTensorList[0].size;
+    const int width = shapes.inTensorList[0].width;
+    const int height = shapes.inTensorList[0].height;
+    const int size = shapes.inTensorList[0].size;
 
-    // 表示用にコピー.
-    Mat img = frame.clone();
+    Mat resized;
+    cv::resize(frame, resized, Size(width, height), 0, 0, cv::INTER_LINEAR);
+    cv::cvtColor(resized, resized, cv::COLOR_BGR2RGB);
 
-    // BGR=>RGBに変換して,リサイズする.
-    cvtColor(img, img, cv::COLOR_BGR2RGB);
-    Mat image2 = cv::Mat(height, width, CV_8SC3); // CV_8SC3 means 3ch singed char data type
-    cv::resize(img, image2, Size(width, height), 0, 0, cv::INTER_LINEAR);
+    const unsigned char *src = resized.data;
+    const float qscale = scale / 256.0f;
 
-    // 画像の各pixelをint8_t型に変換する.
-    unsigned char *imdata = image2.data;
     for (int i = 0; i < size; ++i)
     {
-        float dataf = static_cast<float>(imdata[i]);
-        data[i] = static_cast<int8_t>(dataf * scale / 256.0f);
+        data[i] = static_cast<int8_t>(src[i] * qscale);
         if (data[i] < 0)
             data[i] = 127;
     }
@@ -770,7 +791,7 @@ int main(const int argc, const char **argv)
 
     // 各種キューの作成
     concurrent_queue<imagePair> shw(100);
-    concurrent_queue<DpuInputFrame> dpuIn(10);
+    concurrent_queue<DpuInputFrame> dpuIn(100);
     concurrent_queue<DpuOutputFrame> dpuOut(kPostprocessThreadCount);
 
     // スレッドの作成
