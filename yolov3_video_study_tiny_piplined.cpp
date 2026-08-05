@@ -365,7 +365,7 @@ void setInputImageForYOLO(const Mat &frame, int8_t *data,
 //     }
 // }
 
-void setInputPointer(const Mat &frame, int8_t *data, float scale)
+void setInputPointer(const Mat &frame, int8_t *data)
 {
     const int width = shapes.inTensorList[0].width;
     const int height = shapes.inTensorList[0].height;
@@ -377,30 +377,35 @@ void setInputPointer(const Mat &frame, int8_t *data, float scale)
     cv::cvtColor(resized, resized, cv::COLOR_BGR2RGB);
 
     const unsigned char *src = resized.data;
-    const float qscale = scale / 256.0f;
+    // const float qscale = scale / 256.0f;
 
+    // for (int i = 0; i < size; ++i)
+    // {
+    //     data[i] = static_cast<int8_t>(src[i] * qscale);
+    //     if (data[i] < 0)
+    //         data[i] = 127;
+    // }
+
+    // input scaleが64を前提として正規化する.
     for (int i = 0; i < size; ++i)
     {
-        data[i] = static_cast<int8_t>(src[i] * qscale);
-        if (data[i] < 0)
-            data[i] = 127;
+        data[i] = static_cast<int8_t>(src[i] >> 2);
     }
 }
 
 // Mat画像をDPUが受け取るin8_t型に変換する関数.
 void preprocess(
     const Mat &frame,
-    int8_t *input_data,
-    float input_scale)
+    int8_t *input_data)
 {
     if (Lbox_on)
     {
-        setInputImageForYOLO(frame, input_data, input_scale);
+        setInputImageForYOLO(frame, input_data);
     }
     else
     {
         // 基本的にこっちを使用する
-        setInputPointer(frame, input_data, input_scale);
+        setInputPointer(frame, input_data);
     }
 }
 
@@ -409,8 +414,7 @@ void preprocessFrame(
     const vector<Mat> &frames,
     std::atomic<int> &nextFrameIndex,
     concurrent_queue<DpuInputFrame> &out,
-    int input_size,
-    float input_scale)
+    int input_size)
 {
     while (true)
     {
@@ -428,7 +432,7 @@ void preprocessFrame(
         dpuInput.input.resize(input_size);
 
         // 処理本体.
-        preprocess(dpuInput.frame, dpuInput.input.data(), input_scale);
+        preprocess(dpuInput.frame, dpuInput.input.data());
 
         // 　デバッグ.
         auto preprocess_end_time = Clock::now();
@@ -762,13 +766,6 @@ int main(const int argc, const char **argv)
     CHECK_EQ(outputCnt, static_cast<int>(kYoloOutputCount))
         << "yolov3-tiny should have two output tensors." << endl;
 
-    // xmodelからスケール用の情報を取得.
-    auto input_scale =
-        get_input_scale(runner->get_input_tensors()[0]);
-    cerr << "input_scale = "
-         << input_scale
-         << endl;
-
     //
     TensorShape inshapes[inputCnt];
     TensorShape outshapes[outputCnt];
@@ -783,7 +780,25 @@ int main(const int argc, const char **argv)
     const int inWidth = shapes.inTensorList[0].width;
     const int batchSize = 1; // fixed
     const int inSize = shapes.inTensorList[0].size * batchSize;
+
+    // input scaleのサイズを取得.
     auto input_scale = get_input_scale(runner->get_input_tensors()[0]);
+    cerr << "input_scale = "
+         << input_scale
+         << endl;
+    // input scaleが64を前提としてpreprocessのコードを組んでいるため,
+    // それ以外の値が設定されている場合はエラーとする.
+    constexpr float expected_input_scale = 64.0f;
+    constexpr float tolerance = 1.0e-4f;
+
+    if (std::abs(input_scale - expected_input_scale) > tolerance)
+    {
+        throw std::runtime_error(
+            "Unsupported input_scale: " +
+            std::to_string(input_scale) +
+            " (expected 64)");
+    }
+
     vector<int> output_mapping = shapes.output_mapping;
     auto conf_output_scale =
         get_output_scale(runner->get_output_tensors()[output_mapping[1]]);
@@ -822,8 +837,7 @@ int main(const int argc, const char **argv)
             ref(preloadedFrames),
             ref(nextFrameIndex),
             ref(dpuIn),
-            inSize,
-            input_scale);
+            inSize);
     }
     for (size_t i = 0; i < kDpuThreadCount; ++i)
     {
