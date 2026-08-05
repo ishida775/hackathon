@@ -55,6 +55,16 @@ bool bReading = true;  // flag of reding input frame
 std::mutex log_mutex;
 constexpr int debug_period = 30;
 
+GraphInfo shapes;
+
+// 各スレッドの並列度
+constexpr size_t kYoloOutputCount = 2;
+constexpr size_t kPreprocessThreadCount = 2;
+constexpr size_t kDpuThreadCount = 1;
+constexpr size_t kPostprocessThreadCount = 2;
+TensorShape inshapes[1];
+TensorShape outshapes[kYoloOutputCount];
+
 // デバッグ用に1フレームごとの処理時間を保存する構造体
 struct FrameTimings
 {
@@ -126,14 +136,6 @@ struct DpuOutputFrame
 queue<pair<int, Mat>> queueInput; // queue of FIFO
 // display frames queue
 priority_queue<imagePair, vector<imagePair>, paircomp> queueShow; // priority queue by index comp.
-
-GraphInfo shapes;
-constexpr size_t kYoloOutputCount = 2;
-constexpr size_t kPreprocessThreadCount = 2;
-constexpr size_t kDpuThreadCount = 1;
-constexpr size_t kPostprocessThreadCount = 2;
-TensorShape inshapes[1];
-TensorShape outshapes[kYoloOutputCount];
 
 // ----------------------------------------------------------------------------------------
 // キュー
