@@ -62,7 +62,7 @@ GraphInfo shapes;
 
 // 各スレッドの並列度
 constexpr size_t kYoloOutputCount = 2;
-constexpr size_t kPreprocessThreadCount = 4;
+constexpr size_t kPreprocessThreadCount = 3;
 constexpr size_t kDpuThreadCount = 1;
 constexpr size_t kPostprocessThreadCount = 1;
 TensorShape inshapes[1];
@@ -302,39 +302,39 @@ vector<Mat> preloadFramesToDram(const char *fileName)
 // 前処理
 // -------------------------------------------------------------------------------------------------------
 
-void setInputImageForYOLO(const Mat &frame, int8_t *data,
-                          float input_scale)
-{
-    Mat img_copy;
-    int width = shapes.inTensorList[0].width;
-    int height = shapes.inTensorList[0].height;
-    int size = shapes.inTensorList[0].size;
-    image img_new = load_image_cv(frame);
-    image img_yolo = letterbox_image(img_new, width, height);
+// void setInputImageForYOLO(const Mat &frame, int8_t *data,
+//                           float input_scale)
+// {
+//     Mat img_copy;
+//     int width = shapes.inTensorList[0].width;
+//     int height = shapes.inTensorList[0].height;
+//     int size = shapes.inTensorList[0].size;
+//     image img_new = load_image_cv(frame);
+//     image img_yolo = letterbox_image(img_new, width, height);
 
-    vector<float> bb(size);
-    for (int b = 0; b < height; ++b)
-    {
-        for (int c = 0; c < width; ++c)
-        {
-            for (int a = 0; a < 3; ++a)
-            {
-                bb[b * width * 3 + c * 3 + a] =
-                    img_yolo.data[a * height * width + b * width + c];
-            }
-        }
-    }
+//     vector<float> bb(size);
+//     for (int b = 0; b < height; ++b)
+//     {
+//         for (int c = 0; c < width; ++c)
+//         {
+//             for (int a = 0; a < 3; ++a)
+//             {
+//                 bb[b * width * 3 + c * 3 + a] =
+//                     img_yolo.data[a * height * width + b * width + c];
+//             }
+//         }
+//     }
 
-    float scale = pow(2, 7);
-    for (int i = 0; i < size; ++i)
-    {
-        data[i] = (int8_t)(bb.data()[i] * input_scale);
-        if (data[i] < 0)
-            data[i] = (int8_t)((float)(127 / scale) * input_scale);
-    }
-    free_image(img_new);
-    free_image(img_yolo);
-}
+//     float scale = pow(2, 7);
+//     for (int i = 0; i < size; ++i)
+//     {
+//         data[i] = (int8_t)(bb.data()[i] * input_scale);
+//         if (data[i] < 0)
+//             data[i] = (int8_t)((float)(127 / scale) * input_scale);
+//     }
+//     free_image(img_new);
+//     free_image(img_yolo);
+// }
 
 // Mat画像をDPUが受け取るin8_t型に変換する関数.
 // preprocessの中身.
@@ -517,6 +517,7 @@ void DPUFrame(
             dpuOutput.output[0].data(),
             dpuOutput.output[1].data()};
 
+        // ここ以前の処理は0.006msで終了したため,dpuのみを計測.
         auto run_dpu_start_time = Clock::now();
 
         run_dpu(
@@ -685,16 +686,9 @@ void displayFrame(concurrent_queue<imagePair> &in)
         buffer << fixed << setprecision(1)
                << (float)pairIndexImg.first / (dura / 1000000.f);
         string a = buffer.str() + " FPS";
-        putText(
-            frame,
-            a,
-            cv::Point(20, 50),
-            cv::FONT_HERSHEY_SIMPLEX,
-            1.5,
-            cv::Scalar(0, 0, 255),
-            3,
-            cv::LINE_AA);
+        putText(frame, a, cv::Point(10, 15), 1, 1, cv::Scalar{0, 0, 240}, 1);
         imshow("YOLOv3 Detection@Xilinx DPU", frame);
+
         auto key = waitKey(1);
         if (key == 27)
         {
