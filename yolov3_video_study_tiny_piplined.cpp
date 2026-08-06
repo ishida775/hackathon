@@ -62,7 +62,7 @@ GraphInfo shapes;
 
 // 各スレッドの並列度
 constexpr size_t kYoloOutputCount = 2;
-constexpr size_t kPreprocessThreadCount = 3;
+constexpr size_t kPreprocessThreadCount = 2;
 constexpr size_t kDpuThreadCount = 1;
 constexpr size_t kPostprocessThreadCount = 1;
 TensorShape inshapes[1];
