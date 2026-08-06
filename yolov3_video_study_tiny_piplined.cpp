@@ -260,11 +260,10 @@ vector<Mat> preloadFramesToDram(const char *fileName)
         totalBytes += img.total() * img.elemSize();
         frames.push_back(std::move(img));
     }
-
+    // slackによると,FPS用の時間測定開始はdramに読み込んだ後でいいらしい.
     auto preload_start_time = Clock::now();
 
     video.release();
-    auto preload_end_time = Clock::now();
     if (frames.empty())
     {
         cout << "No frames decoded from specified video file:" << videoFile << endl;
@@ -284,7 +283,7 @@ vector<Mat> preloadFramesToDram(const char *fileName)
 // 前処理
 // -------------------------------------------------------------------------------------------------------
 
-void setInputPointer(const Mat &frame, int8_t *data)
+void setInputPointer(const Mat &frame, int8_t *data, float scale)
 {
     const int width = shapes.inTensorList[0].width;
     const int height = shapes.inTensorList[0].height;
@@ -302,19 +301,34 @@ void setInputPointer(const Mat &frame, int8_t *data)
     const uint8_t *src = resized.data;
 
     // BGRをニューラルネットワーク用のRGB順に変換し,スケールを戻す.
-    // input_scale=64なので、pixel * 64 / 256 = pixel >> 2。
-    for (int i = 0; i < size; i += 3)
+    // もし,スケールが2の累乗であれば,シフト演算で計算できる.
+    int is_pow_of_2 = (scale > 0) && ((scale & (scale - 1)) == 0);
+    if (is_pow_of_2)
     {
-        data[i + 0] = static_cast<int8_t>(src[i + 2] >> 2); // R
-        data[i + 1] = static_cast<int8_t>(src[i + 1] >> 2); // G
-        data[i + 2] = static_cast<int8_t>(src[i + 0] >> 2); // B
+        int shift = static_cast<int>(log2(scale));
+        for (int i = 0; i < size; i += 3)
+        {
+            data[i + 0] = static_cast<int8_t>(src[i + 2] >> shift); // R
+            data[i + 1] = static_cast<int8_t>(src[i + 1] >> shift); // G
+            data[i + 2] = static_cast<int8_t>(src[i + 0] >> shift); // B
+        }
+    }
+    else
+    {
+        for (int i = 0; i < size; i += 3)
+        {
+            data[i + 0] = static_cast<int8_t>(src[i + 2] / scale); // R
+            data[i + 1] = static_cast<int8_t>(src[i + 1] / scale); // G
+            data[i + 2] = static_cast<int8_t>(src[i + 0] / scale); // B
+        }
     }
 }
 
 // Mat画像をDPUが受け取るin8_t型に変換する関数.
 void preprocess(
     const Mat &frame,
-    int8_t *input_data)
+    int8_t *input_data,
+    float input_scale)
 {
     if (Lbox_on)
     {
@@ -323,7 +337,7 @@ void preprocess(
     else
     {
         // 基本的にこっちを使用する
-        setInputPointer(frame, input_data);
+        setInputPointer(frame, input_data, input_scale);
     }
 }
 
@@ -332,7 +346,7 @@ void preprocessFrame(
     const vector<Mat> &frames,
     std::atomic<int> &nextFrameIndex,
     concurrent_queue<DpuInputFrame> &out,
-    int input_size)
+    int input_size, float input_scale)
 {
     while (true)
     {
@@ -350,7 +364,7 @@ void preprocessFrame(
         dpuInput.input.resize(input_size);
 
         // 処理本体.
-        preprocess(dpuInput.frame, dpuInput.input.data());
+        preprocess(dpuInput.frame, dpuInput.input.data(), input_scale);
 
         // 　デバッグ.
         auto preprocess_end_time = Clock::now();
@@ -712,8 +726,8 @@ int main(const int argc, const char **argv)
          << endl;
     // input scaleが64のモデルを前提としてpreprocessのコードを組んでいるため,
     // それ以外の値が設定されている場合はエラーとする.
-    constexpr float expected_input_scale = 64.0f;
-    constexpr float tolerance = 1.0e-4f;
+    // constexpr float expected_input_scale = 64.0f;
+    // constexpr float tolerance = 1.0e-4f;
 
     if (std::abs(input_scale - expected_input_scale) > tolerance)
     {
@@ -754,7 +768,8 @@ int main(const int argc, const char **argv)
             ref(preloadedFrames),
             ref(nextFrameIndex),
             ref(dpuIn),
-            inSize);
+            inSize,
+            input_scale);
     }
     for (size_t i = 0; i < kDpuThreadCount; ++i)
     {
