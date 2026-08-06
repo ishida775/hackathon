@@ -223,26 +223,6 @@ public:
     }
 };
 
-void monitorQueues(
-    std::atomic<int> &nextFrameIndex,
-    size_t preloadedFrameCount,
-    concurrent_queue<DpuInputFrame> &dpuIn,
-    concurrent_queue<DpuOutputFrame> &dpuOut,
-    concurrent_queue<imagePair> &shw)
-{
-    while (true)
-    {
-        std::this_thread::sleep_for(std::chrono::seconds(1));
-        std::unique_lock<std::mutex> guard(log_mutex);
-        cerr << "[queue] sourceIndex=" << nextFrameIndex.load()
-             << " preloaded=" << preloadedFrameCount
-             << " dpuIn=" << dpuIn.size()
-             << " dpuOut=" << dpuOut.size()
-             << " shw=" << shw.size()
-             << endl;
-    }
-}
-
 // ----------------------------------------------------------------------------------------
 // 動画を処理の前にdramにロードする関数
 // ----------------------------------------------------------------------------------------
@@ -661,7 +641,12 @@ void postprocessFrame(
 // -------------------------------------------------------------------------------------------------------
 // 動画を表示
 // -------------------------------------------------------------------------------------------------------
-void displayFrame(concurrent_queue<imagePair> &in)
+void displayFrame(
+    concurrent_queue<imagePair> &in,
+    std::atomic<int> &nextFrameIndex,
+    size_t preloadedFrameCount,
+    concurrent_queue<DpuInputFrame> &dpuIn,
+    concurrent_queue<DpuOutputFrame> &dpuOut)
 {
     Mat frame;
     int index;
@@ -702,7 +687,8 @@ void displayFrame(concurrent_queue<imagePair> &in)
             elapsed_us(display_start_time, display_end_time);
 
         // debug情報の表示
-        // 各Frameの処理時間を表示する.
+        // 各Frameの処理時間とキュー情報を同じタイミングで表示する.
+        ++displayedCount;
         if (should_print_debug(displayedCount))
         {
             std::unique_lock<std::mutex> guard(log_mutex);
@@ -718,8 +704,14 @@ void displayFrame(concurrent_queue<imagePair> &in)
                  << " displayFrame="
                  << us_to_ms(pairIndexImg.timings.display_frame_us) << "ms"
                  << endl;
+            cerr << "[queue] frame=" << index
+                 << " sourceIndex=" << nextFrameIndex.load()
+                 << " preloaded=" << preloadedFrameCount
+                 << " dpuIn=" << dpuIn.size()
+                 << " dpuOut=" << dpuOut.size()
+                 << " shw=" << in.size()
+                 << endl;
         }
-        ++displayedCount;
     }
 }
 
@@ -800,7 +792,7 @@ int main(const int argc, const char **argv)
         std::unique_lock<std::mutex> guard(log_mutex);
         cerr << "[debug] debug_period=" << debug_period
              << " preloadedFrames=" << preloadedFrames.size()
-             << " timing output: first displayed frame and every debug_period frames"
+             << " timing/queue output: first displayed frame and every debug_period displayed frames"
              << endl;
     }
 
@@ -814,15 +806,8 @@ int main(const int argc, const char **argv)
     // スレッドの作成
     vector<thread> threadsList;
     threadsList.reserve(
-        2 + kPreprocessThreadCount + kDpuThreadCount + kPostprocessThreadCount);
+        1 + kPreprocessThreadCount + kDpuThreadCount + kPostprocessThreadCount);
     start_time = chrono::system_clock::now();
-    threadsList.emplace_back(
-        monitorQueues,
-        ref(nextFrameIndex),
-        preloadedFrames.size(),
-        ref(dpuIn),
-        ref(dpuOut),
-        ref(shw));
     for (size_t i = 0; i < kPreprocessThreadCount; ++i)
     {
         threadsList.emplace_back(
@@ -841,7 +826,13 @@ int main(const int argc, const char **argv)
         threadsList.emplace_back(
             postprocessFrame, ref(dpuOut), ref(shw), conf_output_scale, inHeight, inWidth);
     }
-    threadsList.emplace_back(displayFrame, ref(shw));
+    threadsList.emplace_back(
+        displayFrame,
+        ref(shw),
+        ref(nextFrameIndex),
+        preloadedFrames.size(),
+        ref(dpuIn),
+        ref(dpuOut));
 
     for (auto &worker : threadsList)
     {
