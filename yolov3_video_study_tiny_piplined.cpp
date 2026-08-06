@@ -305,23 +305,36 @@ void setInputPointer(const Mat &frame, int8_t *data, float scale)
     int is_integer = scale > 0 && (scale == static_cast<int>(scale));
     int int_scale = static_cast<int>(scale);
     int is_pow_of_2 = (int_scale > 0) && ((int_scale & (int_scale - 1)) == 0);
+    // 256 = 2^8 で除算した後,sscaleをかける.shiftは左シフトを正ととった場合のシフト量.
+    int shift = static_cast<int>(log2(int_scale)) - 8;
     if (is_pow_of_2 && is_integer)
     {
-        int shift = static_cast<int>(log2(int_scale));
-        for (int i = 0; i < size; i += 3)
+        if (shift > 0)
         {
-            data[i + 0] = static_cast<int8_t>(src[i + 2] >> shift); // R
-            data[i + 1] = static_cast<int8_t>(src[i + 1] >> shift); // G
-            data[i + 2] = static_cast<int8_t>(src[i + 0] >> shift); // B
+            for (int i = 0; i < size; i += 3)
+            {
+                data[i + 0] = static_cast<int8_t>(src[i + 2] << shift); // R
+                data[i + 1] = static_cast<int8_t>(src[i + 1] << shift); // G
+                data[i + 2] = static_cast<int8_t>(src[i + 0] << shift); // B
+            }
+        }
+        else
+        {
+            for (int i = 0; i < size; i += 3)
+            {
+                data[i + 0] = static_cast<int8_t>(src[i + 2] >> (-shift)); // R
+                data[i + 1] = static_cast<int8_t>(src[i + 1] >> (-shift)); // G
+                data[i + 2] = static_cast<int8_t>(src[i + 0] >> (-shift)); // B
+            }
         }
     }
     else
     {
         for (int i = 0; i < size; i += 3)
         {
-            data[i + 0] = static_cast<int8_t>(src[i + 2] / scale); // R
-            data[i + 1] = static_cast<int8_t>(src[i + 1] / scale); // G
-            data[i + 2] = static_cast<int8_t>(src[i + 0] / scale); // B
+            data[i + 0] = static_cast<int8_t>(src[i + 2] * scale / 256.0); // R
+            data[i + 1] = static_cast<int8_t>(src[i + 1] * scale / 256.0); // G
+            data[i + 2] = static_cast<int8_t>(src[i + 0] * scale / 256.0); // B
         }
     }
 }
@@ -730,14 +743,13 @@ int main(const int argc, const char **argv)
     // それ以外の値が設定されている場合はエラーとする.
     // constexpr float expected_input_scale = 64.0f;
     // constexpr float tolerance = 1.0e-4f;
-
-    if (std::abs(input_scale - expected_input_scale) > tolerance)
-    {
-        throw std::runtime_error(
-            "Unsupported input_scale: " +
-            std::to_string(input_scale) +
-            " (expected 64)");
-    }
+    // if (std::abs(input_scale - expected_input_scale) > tolerance)
+    // {
+    //     throw std::runtime_error(
+    //         "Unsupported input_scale: " +
+    //         std::to_string(input_scale) +
+    //         " (expected 64)");
+    // }
 
     vector<int> output_mapping = shapes.output_mapping;
     auto conf_output_scale =
