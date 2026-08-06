@@ -246,7 +246,7 @@ vector<Mat> preloadFramesToDram(const char *fileName)
     }
 
     size_t totalBytes = 0;
-    auto preload_start_time = Clock::now();
+    // auto preload_start_time = Clock::now();
 
     // 1フレームずつデコードして,framesに格納.
     while (true)
@@ -260,6 +260,8 @@ vector<Mat> preloadFramesToDram(const char *fileName)
         totalBytes += img.total() * img.elemSize();
         frames.push_back(std::move(img));
     }
+
+    auto preload_start_time = Clock::now();
 
     video.release();
     auto preload_end_time = Clock::now();
@@ -282,69 +284,6 @@ vector<Mat> preloadFramesToDram(const char *fileName)
 // 前処理
 // -------------------------------------------------------------------------------------------------------
 
-// void setInputImageForYOLO(const Mat &frame, int8_t *data,
-//                           float input_scale)
-// {
-//     Mat img_copy;
-//     int width = shapes.inTensorList[0].width;
-//     int height = shapes.inTensorList[0].height;
-//     int size = shapes.inTensorList[0].size;
-//     image img_new = load_image_cv(frame);
-//     image img_yolo = letterbox_image(img_new, width, height);
-
-//     vector<float> bb(size);
-//     for (int b = 0; b < height; ++b)
-//     {
-//         for (int c = 0; c < width; ++c)
-//         {
-//             for (int a = 0; a < 3; ++a)
-//             {
-//                 bb[b * width * 3 + c * 3 + a] =
-//                     img_yolo.data[a * height * width + b * width + c];
-//             }
-//         }
-//     }
-
-//     float scale = pow(2, 7);
-//     for (int i = 0; i < size; ++i)
-//     {
-//         data[i] = (int8_t)(bb.data()[i] * input_scale);
-//         if (data[i] < 0)
-//             data[i] = (int8_t)((float)(127 / scale) * input_scale);
-//     }
-//     free_image(img_new);
-//     free_image(img_yolo);
-// }
-
-// Mat画像をDPUが受け取るin8_t型に変換する関数.
-// preprocessの中身.
-// void setInputPointer(const Mat &frame, int8_t *data,
-//                      float scale)
-// {
-//     // 入力したxmodelのtensorのサイズを取得.
-//     int width = shapes.inTensorList[0].width;
-//     int height = shapes.inTensorList[0].height;
-//     int size = shapes.inTensorList[0].size;
-
-//     // 表示用にコピー.
-//     Mat img = frame.clone();
-
-//     // BGR=>RGBに変換して,リサイズする.
-//     cvtColor(img, img, cv::COLOR_BGR2RGB);
-//     Mat image2 = cv::Mat(height, width, CV_8SC3); // CV_8SC3 means 3ch singed char data type
-//     cv::resize(img, image2, Size(width, height), 0, 0, cv::INTER_LINEAR);
-
-//     // 画像の各pixelをint8_t型に変換する.
-//     unsigned char *imdata = image2.data;
-//     for (int i = 0; i < size; ++i)
-//     {
-//         float dataf = static_cast<float>(imdata[i]);
-//         data[i] = static_cast<int8_t>(dataf * scale / 256.0f);
-//         if (data[i] < 0)
-//             data[i] = 127;
-//     }
-// }
-
 void setInputPointer(const Mat &frame, int8_t *data)
 {
     const int width = shapes.inTensorList[0].width;
@@ -362,7 +301,7 @@ void setInputPointer(const Mat &frame, int8_t *data)
 
     const uint8_t *src = resized.data;
 
-    // resizedはBGR順、DPU入力はRGB順。
+    // BGRをニューラルネットワーク用のRGB順に変換し,スケールを戻す.
     // input_scale=64なので、pixel * 64 / 256 = pixel >> 2。
     for (int i = 0; i < size; i += 3)
     {
