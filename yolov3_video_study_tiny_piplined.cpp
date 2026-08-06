@@ -302,10 +302,12 @@ void setInputPointer(const Mat &frame, int8_t *data, float scale)
 
     // BGRをニューラルネットワーク用のRGB順に変換し,スケールを戻す.
     // もし,スケールが2の累乗であれば,シフト演算で計算できる.
-    int is_pow_of_2 = (scale > 0) && ((scale & (scale - 1)) == 0);
-    if (is_pow_of_2)
+    int is_integer = scale > 0 && (scale == static_cast<int>(scale));
+    int int_scale = static_cast<int>(scale);
+    int is_pow_of_2 = (int_scale > 0) && ((int_scale & (int_scale - 1)) == 0);
+    if (is_pow_of_2 && is_integer)
     {
-        int shift = static_cast<int>(log2(scale));
+        int shift = static_cast<int>(log2(int_scale));
         for (int i = 0; i < size; i += 3)
         {
             data[i + 0] = static_cast<int8_t>(src[i + 2] >> shift); // R
