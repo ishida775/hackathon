@@ -246,7 +246,7 @@ vector<Mat> preloadFramesToDram(const char *fileName)
     }
 
     size_t totalBytes = 0;
-    // auto preload_start_time = Clock::now();
+    auto preload_start_time = chrono::system_clock::now();
 
     // 1フレームずつデコードして,framesに格納.
     while (true)
@@ -260,9 +260,9 @@ vector<Mat> preloadFramesToDram(const char *fileName)
         totalBytes += img.total() * img.elemSize();
         frames.push_back(std::move(img));
     }
-    // slackによると,FPS用の時間測定開始はdramに読み込んだ後でいいらしい.
-    auto preload_start_time = Clock::now();
 
+    auto preload_end_time = chrono::system_clock::now();
+    auto start_time = chrono::system_clock::now();
     video.release();
     if (frames.empty())
     {
